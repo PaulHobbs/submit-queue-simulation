@@ -379,9 +379,9 @@ func main() {
 				mbPassRate = float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
 			}
 
-			avgSubmitTime := 0.0
+			avgSubmitTime := 1.0  // minimum 1h per submit.
 			if sq.TotalSubmitted > 0 {
-				avgSubmitTime = float64(sq.TotalWaitTicks) / float64(sq.TotalSubmitted)
+				avgSubmitTime += float64(sq.TotalWaitTicks) / float64(sq.TotalSubmitted)
 			}
 
 			throughput := float64(submittedTotal) / float64(nIter)
