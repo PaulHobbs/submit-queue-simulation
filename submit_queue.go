@@ -441,6 +441,7 @@ func (sq *PipelinedSubmitQueue) applyEffect(cl *Change, currentTick int) {
 var nChangesPerHour = []int{5, 5, 5, 5, 5, 5, 5, 5, 60, 60, 60, 60, 60, 60, 60, 60, 10, 10, 10, 10, 10, 10, 10, 10}
 
 const idealThroughput = 25
+const nSamples = 100
 
 // SimConfig defines the parameters for one simulation run.
 type SimConfig struct {
@@ -460,10 +461,10 @@ type SimResult struct {
 	AvgSubmitTime float64
 }
 
-func runSimulation(cfg SimConfig) SimResult {
-	const nIter = 30000
-	// Use SeqID to ensure different seeds for different configs
-	rng := NewFastRNG(int64(cfg.SeqID * 997))
+func runSimulation(cfg SimConfig, seed int64) SimResult {
+	const nIter = 5000 // 5k hours = 208 days
+	// Use provided seed to ensure different seeds for different configs and samples
+	rng := NewFastRNG(seed)
 
 	testDefs := make([]TestDefinition, cfg.NTests)
 	for i := 0; i < cfg.NTests; i++ {
@@ -539,6 +540,30 @@ func runSimulation(cfg SimConfig) SimResult {
 	}
 }
 
+// runAveragedSimulation performs nSamples of the simulation and returns averaged results.
+func runAveragedSimulation(cfg SimConfig) SimResult {
+	var sumSlowdown, sumQSize, sumMBPassRate, sumSubmitTime float64
+
+	for i := 0; i < nSamples; i++ {
+		// Generate a unique seed for every sample of every config
+		seed := int64((cfg.SeqID*nSamples + i) * 997)
+		res := runSimulation(cfg, seed)
+
+		sumSlowdown += res.Slowdown
+		sumQSize += res.AvgQueueSize
+		sumMBPassRate += res.MBPassRate
+		sumSubmitTime += res.AvgSubmitTime
+	}
+
+	return SimResult{
+		Config:        cfg,
+		Slowdown:      sumSlowdown / float64(nSamples),
+		AvgQueueSize:  sumQSize / float64(nSamples),
+		MBPassRate:    sumMBPassRate / float64(nSamples),
+		AvgSubmitTime: sumSubmitTime / float64(nSamples),
+	}
+}
+
 // printIncremental handles the stateful header printing and the result row.
 func printIncremental(res SimResult, lastCfg *SimConfig) {
 	cfg := res.Config
@@ -608,7 +633,7 @@ func main() {
 					}
 					go func(c SimConfig) {
 						defer wg.Done()
-						resultsCh <- runSimulation(c)
+						resultsCh <- runAveragedSimulation(c)
 					}(cfg)
 					seqCounter++
 				}

@@ -24,10 +24,10 @@ It is written in Go and utilizes goroutines to run dozens of simulation scenario
 No external dependencies are required beyond a standard Go installation.
 
 ```bash
-go run main.go
+go run submit_queue.go
 ```
 
-*Note: The simulation performs heavy computation. It runs 30,000 ticks for every permutation of parameters. On a standard laptop, a full run will take 30-180 seconds, utilizing all available CPU cores.*
+*Note: The simulation performs heavy computation and will take all your CPU cores for minutes to hours.* 
 
 ## Configuration & Parameters
 
