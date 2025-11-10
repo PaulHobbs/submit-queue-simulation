@@ -169,22 +169,22 @@ class PipelinedSubmitQueue:
 
 
 if __name__ == "__main__":
-    N_ITER = 10000
-    N_CHANGES_PER_HOUR = 50
-    FIXED_DEPTH = 8  # Fixing depth to isolate effect of batch size
+    N_ITER = 4000
+    N_CHANGES_PER_HOUR = [10] * 8 + [100] * 8 + [20] * 8
+    FIXED_DEPTH = 4  # Fixing depth to isolate effect of batch size
 
     print(f"Pipeline Depth fixed at: {FIXED_DEPTH}")
     print(f"{'Max Batch':<10} | {'Throughput (CLs/tick)':<22} | {'Average Queue Size'}")
     print("-" * 55)
 
-    for n_tests in [8, 16, 32]:
+    for n_tests in [8, 16, 32, 64]:
         print(f"n_tests: {n_tests}")
-        for max_mb in [16, 32, 64, 128]:
+        for max_mb in [32, 64, 128, 256]:
             total_q = 0
             test_defs = [
                 TestDefinition(
                     id=i,
-                    p_affected=0.001,
+                    p_affected=0.01,
                     # 80% of regressions are to flaky state
                     pass_rates=[(0.50, 1.0), (0.90, 0.99), (1.0, 0.0)],
                 )
@@ -195,16 +195,18 @@ if __name__ == "__main__":
             )
 
             submitted_total = 0
-            sq.add_changes(N_CHANGES_PER_HOUR)
+            sq.add_changes(N_CHANGES_PER_HOUR[-1])
 
-            for _ in range(N_ITER):
+            for i in range(N_ITER):
                 submitted_total += sq.step()
                 total_q += len(sq.pending_changes)
-                if len(sq.pending_changes) < 500:
-                    sq.add_changes(N_CHANGES_PER_HOUR)
-                elif len(sq.pending_changes) < 1000:
+                if len(sq.pending_changes) < 200:
+                    sq.add_changes(N_CHANGES_PER_HOUR[i % 24])
+                elif len(sq.pending_changes) < 400:
                     # When developers have pending work, they upload less work per hour
-                    sq.add_changes(N_CHANGES_PER_HOUR // 2)
+                    sq.add_changes(N_CHANGES_PER_HOUR[i % 24] // 2)
+                elif len(sq.pending_changes) < 800:
+                    sq.add_changes(N_CHANGES_PER_HOUR[i % 24] // 4)
             else:
                 throughput = submitted_total / N_ITER
                 print(f"{max_mb:<10} | {throughput:<22.2f} | {total_q / N_ITER:.0f}")
