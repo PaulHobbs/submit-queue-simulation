@@ -6,8 +6,7 @@ import (
 	"math/rand"
 )
 
-// --- Randomness Engine ---
-// Precompute randoms to make random.random() extremely fast
+// Precompute randoms to make rng very fast
 const maxRand = 10_000_000
 
 var (
@@ -24,6 +23,8 @@ func init() {
 	}
 }
 
+// fastRand uses precomputed pseudorandom numbers. This is *much* faster than
+// calling rng.Float64() in a loop.
 func fastRand() float64 {
 	randI += 123456
 	randI *= 777777
@@ -33,18 +34,24 @@ func fastRand() float64 {
 
 // --- Data Structures ---
 
+// DistEntry is a single row in a cumulative distribution
 type DistEntry struct {
 	Limit float64
 	Value float64
 }
+// Distribution is a cumulative distribution
+type Distribution []DistEntry
 
+// TestDefinition keeps track of a test's tendency to be affected by CLs and its
+// historical regression pass rate distribution.
 type TestDefinition struct {
 	ID        int
 	PAffected float64
-	PassRates []DistEntry
+	PassRates Distribution
 }
 
-func sample(d []DistEntry) float64 {
+// sample takes a random sample of a Distribution
+func sample(d Distribution) float64 {
 	s := fastRand()
 	for _, e := range d {
 		if s < e.Limit {
@@ -54,6 +61,7 @@ func sample(d []DistEntry) float64 {
 	return d[len(d)-1].Value
 }
 
+// Change keeps track of which tests a Change affects.
 type Change struct {
 	ID           int
 	CreationTick int             // Feature 3: Track creation time for submit stats
@@ -74,6 +82,9 @@ func NewChange(id, tick int, testDefs []TestDefinition) *Change {
 	return c
 }
 
+// IsHardBreak is true only if the test has 100% fail rate.
+// These tests can be debugged and fixed by culprit finding / developers after
+// quarantine.
 func (c *Change) IsHardBreak() bool {
 	for _, e := range c.Effects {
 		if e == 0.0 {
@@ -83,6 +94,7 @@ func (c *Change) IsHardBreak() bool {
 	return false
 }
 
+// FixHardBreaks simulates quarantine & culprit finding of a failed run.
 func (c *Change) FixHardBreaks(testDefs []TestDefinition) {
 	for tid, effect := range c.Effects {
 		if effect == 0.0 {
@@ -114,6 +126,7 @@ func (c *Change) FixHardBreaks(testDefs []TestDefinition) {
 	}
 }
 
+// Minibatch keeps a subset of the pending change which can be evaluated in a run.
 type Minibatch struct {
 	Changes    []*Change
 	NewChanges []*Change
@@ -151,18 +164,20 @@ func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int) (
 	return passed, hardFailure
 }
 
-// --- PipelinedSubmitQueue ---
-
+// PipelinedSubmitQueue keeps the state of the tests, pending changes, and minibatch statistics.
 type PipelinedSubmitQueue struct {
+	// --- Configuration ---
 	TestDefs         []TestDefinition
 	AllTestIDs       []int
-	RepoBasePPass    map[int]float64
 	PipelineDepth    int
 	MaxMinibatchSize int
+
+	// --- State ---
+	RepoBasePPass    map[int]float64
 	PendingChanges   []*Change
 	ChangeIDCounter  int
 
-	// --- Statistics for Features 2 & 3 ---
+	// --- Statistics ---
 	TotalMinibatches    int
 	PassedMinibatches   int
 	TotalSubmitted      int
@@ -185,6 +200,7 @@ func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int) *Pipel
 	return sq
 }
 
+// AddChanges queues up more changes to be processed.
 func (sq *PipelinedSubmitQueue) AddChanges(n, currentTick int) {
 	for i := 0; i < n; i++ {
 		sq.PendingChanges = append(sq.PendingChanges, NewChange(sq.ChangeIDCounter, currentTick, sq.TestDefs))
@@ -192,6 +208,7 @@ func (sq *PipelinedSubmitQueue) AddChanges(n, currentTick int) {
 	}
 }
 
+// Step runs a single step of the submit queue.
 func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 	pendingCount := len(sq.PendingChanges)
 	if pendingCount == 0 {
