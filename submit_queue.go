@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"sort"
 	"sync"
 	"time"
 )
@@ -445,6 +444,7 @@ const idealThroughput = 25
 
 // SimConfig defines the parameters for one simulation run.
 type SimConfig struct {
+	SeqID       int // For ordered output
 	Parallelism int
 	Traffic     int
 	NTests      int
@@ -462,7 +462,8 @@ type SimResult struct {
 
 func runSimulation(cfg SimConfig) SimResult {
 	const nIter = 30000
-	rng := NewFastRNG(int64(cfg.Parallelism*1000 + cfg.Traffic*100 + cfg.NTests + cfg.MaxBatch))
+	// Use SeqID to ensure different seeds for different configs
+	rng := NewFastRNG(int64(cfg.SeqID * 997))
 
 	testDefs := make([]TestDefinition, cfg.NTests)
 	for i := 0; i < cfg.NTests; i++ {
@@ -512,18 +513,15 @@ func runSimulation(cfg SimConfig) SimResult {
 		} else if qSize >= 800 {
 			changesToAdd /= 8
 		}
-
 		if changesToAdd > 0 {
 			sq.AddChanges(changesToAdd, i)
 		}
 	}
 
-	avgQ := float64(totalQ) / float64(nIter)
 	mbPassRate := 0.0
 	if sq.TotalMinibatches > 0 {
 		mbPassRate = float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
 	}
-
 	avgSubmitTime := 1.0
 	if sq.TotalSubmitted > 0 {
 		avgSubmitTime += float64(sq.TotalWaitTicks) / float64(sq.TotalSubmitted)
@@ -535,65 +533,74 @@ func runSimulation(cfg SimConfig) SimResult {
 	return SimResult{
 		Config:        cfg,
 		Slowdown:      slowdown,
-		AvgQueueSize:  avgQ,
+		AvgQueueSize:  float64(totalQ) / float64(nIter),
 		MBPassRate:    mbPassRate,
 		AvgSubmitTime: avgSubmitTime,
 	}
 }
 
-func prettyPrintResults(results []SimResult) {
-	// Sort to ensure consistent output order regardless of goroutine finish time
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Config.Parallelism != results[j].Config.Parallelism {
-			return results[i].Config.Parallelism < results[j].Config.Parallelism
-		}
-		if results[i].Config.Traffic != results[j].Config.Traffic {
-			return results[i].Config.Traffic < results[j].Config.Traffic
-		}
-		if results[i].Config.NTests != results[j].Config.NTests {
-			return results[i].Config.NTests < results[j].Config.NTests
-		}
-		return results[i].Config.MaxBatch < results[j].Config.MaxBatch
-	})
-
-	var lastCfg SimConfig
-	for i, res := range results {
-		cfg := res.Config
-
-		// Print section headers when configuration changes significantly
-		if i == 0 || cfg.Parallelism != lastCfg.Parallelism {
-			fmt.Printf("Pipeline depth/parellism: %d\n", cfg.Parallelism)
-		}
-		if i == 0 || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic {
-			fmt.Printf("\nIdeal throughput: %d CLs/hour = Productivity 1/1x \n", 25*cfg.Traffic)
-			fmt.Printf("%-10s | %-22s | %-14s | %-9s | %s\n",
-				"Max Batch", "Productivity * 1/x", "Avg Queue Size", "Pass Rate", "Avg Time to Submit (h)")
-			fmt.Println("-------------------------------------------------------------------------------------------------------------")
-		}
-		if i == 0 || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
-			fmt.Printf("n_tests: %d\n", cfg.NTests)
-		}
-
-		fmt.Printf("%-10d | %-22.2f | %-14.0f | %-9.2f | %.2f\n",
-			cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, res.AvgSubmitTime)
-
-		lastCfg = cfg
+// printIncremental handles the stateful header printing and the result row.
+func printIncremental(res SimResult, lastCfg *SimConfig) {
+	cfg := res.Config
+	// Print headers if major parameters changed compared to the last printed result
+	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism {
+		fmt.Printf("Pipeline depth/parallelism: %d\n", cfg.Parallelism)
 	}
+	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic {
+		fmt.Printf("\nIdeal throughput: %d CLs/hour = Productivity 1/1x \n", 25*cfg.Traffic)
+		fmt.Printf("%-10s | %-22s | %-14s | %-9s | %s\n",
+			"Max Batch", "Productivity * 1/x", "Avg Queue Size", "Pass Rate", "Avg Time to Submit (h)")
+		fmt.Println("-------------------------------------------------------------------------------------------------------------")
+	}
+	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
+		fmt.Printf("n_tests: %d\n", cfg.NTests)
+	}
+
+	fmt.Printf("%-10d | %-22.2f | %-14.0f | %-9.2f | %.2f\n",
+		cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, res.AvgSubmitTime)
 }
 
 func main() {
-	resultsCh := make(chan SimResult, 500)
+	resultsCh := make(chan SimResult, 100)
 	var wg sync.WaitGroup
-
 	start := time.Now()
 
-	// Spawn all simulations in parallel
+	// 1. Start the ordered printer goroutine
+	printDone := make(chan struct{})
+	go func() {
+		defer close(printDone)
+		buffer := make(map[int]SimResult)
+		nextExpectedID := 0
+		var lastCfg *SimConfig
+
+		for res := range resultsCh {
+			buffer[res.Config.SeqID] = res
+
+			// Try to print as many contiguous results as possible from the buffer
+			for {
+				if nextRes, ok := buffer[nextExpectedID]; ok {
+					printIncremental(nextRes, lastCfg)
+					// keep a copy of the config for stateful header printing
+					cfgCopy := nextRes.Config
+					lastCfg = &cfgCopy
+					delete(buffer, nextExpectedID)
+					nextExpectedID++
+				} else {
+					break
+				}
+			}
+		}
+	}()
+
+	// 2. Spawn all simulations
+	seqCounter := 0
 	for _, parallelism := range []int{1, 2, 4, 8} {
 		for _, traffic := range []int{1, 2, 3, 4} {
 			for _, nTests := range []int{16, 32, 64, 128} {
 				for _, maxBatch := range []int{32, 64, 128} {
 					wg.Add(1)
 					cfg := SimConfig{
+						SeqID:       seqCounter,
 						Parallelism: parallelism,
 						Traffic:     traffic,
 						NTests:      nTests,
@@ -603,23 +610,18 @@ func main() {
 						defer wg.Done()
 						resultsCh <- runSimulation(c)
 					}(cfg)
+					seqCounter++
 				}
 			}
 		}
 	}
 
-	// Wait for all to finish in a separate goroutine to close the channel
+	// 3. Wait for simulations to finish, then close channels
 	go func() {
 		wg.Wait()
 		close(resultsCh)
 	}()
 
-	// Collect results
-	var allResults []SimResult
-	for res := range resultsCh {
-		allResults = append(allResults, res)
-	}
-
-	fmt.Printf("Simulations complete in %v. Printing results...\n\n", time.Since(start))
-	prettyPrintResults(allResults)
+	<-printDone
+	fmt.Printf("\nAll simulations complete in %v.\n", time.Since(start))
 }
