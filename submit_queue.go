@@ -185,14 +185,14 @@ type PipelinedSubmitQueue struct {
 	RepoBasePPass   map[int]float64
 	PendingChanges  []*Change
 	ChangeIDCounter int
-	UseParallelMode bool // Toggle for dynamic fallback strategy
+	UseParallelMode bool     // Toggle for dynamic fallback strategy
+	rng             *FastRNG // Local RNG for this queue simulation
 
 	// --- Statistics ---
 	TotalMinibatches  int
 	PassedMinibatches int
 	TotalSubmitted    int
-	TotalWaitTicks    int      // Sum of (SubmitTick - CreationTick) for all submitted CLs
-	rng               *FastRNG // Local RNG for this queue simulation
+	TotalWaitTicks    int // Sum of (SubmitTick - CreationTick) for all submitted CLs
 }
 
 func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int, rng *FastRNG) *PipelinedSubmitQueue {
@@ -211,6 +211,14 @@ func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int, rng *F
 		sq.RepoBasePPass[t.ID] = 1.0
 	}
 	return sq
+}
+
+// ResetStats clears the cumulative statistics, used after the priming phase.
+func (sq *PipelinedSubmitQueue) ResetStats() {
+	sq.TotalMinibatches = 0
+	sq.PassedMinibatches = 0
+	sq.TotalSubmitted = 0
+	sq.TotalWaitTicks = 0
 }
 
 func (sq *PipelinedSubmitQueue) AddChanges(n, currentTick int) {
@@ -438,9 +446,9 @@ func (sq *PipelinedSubmitQueue) applyEffect(cl *Change, currentTick int) {
 
 // --- Simulation & Reporting ---
 
-var nChangesPerHour = []int{5, 5, 5, 5, 5, 5, 5, 5, 60, 60, 60, 60, 60, 60, 60, 60, 10, 10, 10, 10, 10, 10, 10, 10}
+var nChangesPer2Hour = []int{5, 5, 5, 5, 60, 60, 60, 60, 10, 10, 10, 10}
 
-const idealThroughput = 25
+const idealThroughput = 25 // per 2hour, 12.5 per h
 const nSamples = 100
 
 // SimConfig defines the parameters for one simulation run.
@@ -462,7 +470,8 @@ type SimResult struct {
 }
 
 func runSimulation(cfg SimConfig, seed int64) SimResult {
-	const nIter = 5000 // 5k hours = 208 days
+	const primingIter = 3 * 6 * 7 // 3w
+	const nIter = 30 * 6 * 7      // 30w
 	// Use provided seed to ensure different seeds for different configs and samples
 	rng := NewFastRNG(seed)
 
@@ -470,9 +479,9 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 	for i := 0; i < cfg.NTests; i++ {
 		testDefs[i] = TestDefinition{
 			ID: i,
-			// Only 0.1% of CLs affect a test's pass rate post-smoketest (TreeHugger)
-			// This means 0.05% of CLs are "bad" (increase a test's failure rate).
-			PAffected: 0.001,
+			// Only 1% of CLs affect a test's pass rate post-smoketest (TreeHugger)
+			// This means 0.5% of CLs are "bad" (increase a test's failure rate).
+			PAffected: 0.01,
 			// Distribution of new pass rates after a transition
 			PassRates: []DistEntry{
 				// Allow a 50% chance for flake to randomly get fixed,
@@ -497,16 +506,30 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 	sq := NewPipelinedSubmitQueue(testDefs, cfg.Parallelism, cfg.MaxBatch, rng)
 
 	// Initial load
-	sq.AddChanges(cfg.Traffic*nChangesPerHour[len(nChangesPerHour)-1], 0)
+	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
 
 	totalQ := 0
 	submittedTotal := 0
-	for i := 0; i < nIter; i++ {
-		submittedTotal += sq.Step(i)
-		totalQ += len(sq.PendingChanges)
 
+	// Run both priming and main simulation in one loop to maintain continuity
+	// of load patterns (nChangesPer2Hour[i%12]).
+	for i := 0; i < primingIter+nIter; i++ {
+		// Once priming is complete, reset statistics to start fresh for nIter.
+		if i == primingIter {
+			sq.ResetStats()
+		}
+
+		submitted := sq.Step(i)
+
+		// Only collect aggregate statistics after priming phase.
+		if i >= primingIter {
+			submittedTotal += submitted
+			totalQ += len(sq.PendingChanges)
+		}
+
+		// Apply load (identical logic for both phases)
 		qSize := len(sq.PendingChanges)
-		changesToAdd := cfg.Traffic * nChangesPerHour[i%24]
+		changesToAdd := cfg.Traffic * nChangesPer2Hour[i%12]
 		if qSize >= 200 && qSize < 400 {
 			changesToAdd /= 2
 		} else if qSize >= 400 && qSize < 800 {
@@ -519,14 +542,8 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		}
 	}
 
-	mbPassRate := 0.0
-	if sq.TotalMinibatches > 0 {
-		mbPassRate = float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
-	}
-	avgSubmitTime := 1.0
-	if sq.TotalSubmitted > 0 {
-		avgSubmitTime += float64(sq.TotalWaitTicks) / float64(sq.TotalSubmitted)
-	}
+	mbPassRate := float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
+	avgSubmitTime := 1.0 + float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
 
 	throughput := float64(submittedTotal) / float64(nIter)
 	slowdown := float64(idealThroughput*cfg.Traffic) / throughput
@@ -572,7 +589,7 @@ func printIncremental(res SimResult, lastCfg *SimConfig) {
 		fmt.Printf("Pipeline depth/parallelism: %d\n", cfg.Parallelism)
 	}
 	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic {
-		fmt.Printf("\nIdeal throughput: %d CLs/hour = Productivity 1/1x \n", 25*cfg.Traffic)
+		fmt.Printf("\nIdeal throughput: %d CLs/2hour = Productivity 1/1x \n", idealThroughput*cfg.Traffic)
 		fmt.Printf("%-10s | %-22s | %-14s | %-9s | %s\n",
 			"Max Batch", "Productivity * 1/x", "Avg Queue Size", "Pass Rate", "Avg Time to Submit (h)")
 		fmt.Println("-------------------------------------------------------------------------------------------------------------")
@@ -619,9 +636,9 @@ func main() {
 
 	// 2. Spawn all simulations
 	seqCounter := 0
-	for _, parallelism := range []int{1, 2, 4, 8} {
-		for _, traffic := range []int{1, 2, 3, 4} {
-			for _, nTests := range []int{16, 32, 64, 128} {
+	for _, parallelism := range []int{2, 4, 8} {
+		for _, traffic := range []int{1, 2} {
+			for _, nTests := range []int{16, 32, 64} {
 				for _, maxBatch := range []int{32, 64, 128} {
 					wg.Add(1)
 					cfg := SimConfig{
