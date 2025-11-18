@@ -1,26 +1,11 @@
 package main
 
 import (
-	"fmt" // Keep fmt for printing results
-	"math"
-	"math/rand/v2" // Use math/rand/v2 for better performance and thread safety
+	"fmt"  // Keep fmt for printing results
+	"math" // Use math/rand/v2 for better performance and thread safety
 	"sync"
 	"time"
 )
-
-// --- Thread-Safe Fast RNG ---
-const maxRand = 10_000_000
-
-// Global precomputed randoms (read-only after init, so thread-safe)
-var rands []float64
-
-func init() {
-	rands = make([]float64, maxRand)
-	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(time.Now().UnixNano()/2))) // Use PCG for better quality
-	for i := range rands {
-		rands[i] = rng.Float64()
-	}
-}
 
 // FastRNG is a per-goroutine RNG state to avoid locking.
 type FastRNG struct {
@@ -102,22 +87,46 @@ func (c *Change) IsHardBreak() bool {
 	return false
 }
 
-// FixHardBreaks simulates quarantine & culprit finding of a failed run.
-func (c *Change) FixHardBreaks(testDefMap map[int]*TestDefinition, testDefs []TestDefinition, rng *FastRNG) {
+// FixHardBreaks simulates a developer fixing a breakage.
+// We assume a fix restores functionality but might still result in a flaky test.
+// We exclude the probability of re-breaking the test (0.0)
+// by normalizing the random sample to the range of non-zero outcomes.
+func (c *Change) FixHardBreaks(testDefMap map[int]*TestDefinition, rng *FastRNG) {
 	for tid, effect := range c.Effects {
 		if effect == 0.0 {
 			tDef := testDefMap[tid]
-			// Try to fix it by resampling a non-zero pass rate
-			newEffect := 0.0
-			for i := 0; i < 10; i++ {
-				newEffect = sample(tDef.PassRates, rng)
-				if newEffect > 0.0 {
+
+			// 1. Find the upper bound (Limit) of the "safe zone".
+			// We scan the cumulative distribution to find the highest Limit
+			// associated with a non-zero Value.
+			safeLimit := 0.0
+			for _, entry := range tDef.PassRates {
+				if entry.Value > 0.0 {
+					safeLimit = entry.Limit
+				}
+			}
+
+			// Edge case: If the test definition is 100% breakage (safeLimit 0),
+			// we simply force a fix to 1.0 to avoid infinite loops or stuck states.
+			if safeLimit == 0.0 {
+				c.Effects[tid] = 1.0
+				continue
+			}
+
+			// 2. Generate a random number scaled strictly to the safe zone.
+			// This effectively renormalizes the CDF to exclude the failure tail.
+			s := rng.Float64() * safeLimit
+
+			// 3. Sample the distribution using the scaled random number.
+			newEffect := 1.0 // Default fallback
+			for _, e := range tDef.PassRates {
+				if s < e.Limit {
+					newEffect = e.Value
 					break
 				}
 			}
-			if newEffect == 0.0 {
-				newEffect = 1.0
-			}
+
+			// 4. Apply the fix
 			c.Effects[tid] = newEffect
 		}
 	}
@@ -288,7 +297,7 @@ func (sq *PipelinedSubmitQueue) stepSpeculative(currentTick int) int {
 				// Fix hard breaks in speculated batches that we won't submit
 				for _, cl := range minibatches[i].NewChanges {
 					if cl.IsHardBreak() {
-						cl.FixHardBreaks(sq.TestDefM, sq.TestDefs, sq.rng)
+						cl.FixHardBreaks(sq.TestDefM, sq.rng)
 					}
 				}
 			}
@@ -304,7 +313,7 @@ func (sq *PipelinedSubmitQueue) stepSpeculative(currentTick int) int {
 			if res.hardFail {
 				for _, cl := range minibatches[i].NewChanges {
 					if cl.IsHardBreak() {
-						cl.FixHardBreaks(sq.TestDefM, sq.TestDefs, sq.rng)
+						cl.FixHardBreaks(sq.TestDefM, sq.rng)
 					}
 				}
 			}
@@ -388,7 +397,7 @@ func (sq *PipelinedSubmitQueue) stepParallel(currentTick int) int {
 		} else if res.hardFail {
 			for _, cl := range minibatches[i].Changes {
 				if cl.IsHardBreak() {
-					cl.FixHardBreaks(sq.TestDefM, sq.TestDefs, sq.rng)
+					cl.FixHardBreaks(sq.TestDefM, sq.rng)
 				}
 			}
 		}
