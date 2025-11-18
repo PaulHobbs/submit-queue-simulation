@@ -1,22 +1,22 @@
 package main
 
 import (
-	"fmt"
+	"fmt" // Keep fmt for printing results
 	"math"
-	"math/rand"
+	"math/rand/v2" // Use math/rand/v2 for better performance and thread safety
 	"sync"
 	"time"
 )
 
 // --- Thread-Safe Fast RNG ---
-const maxRand = 1_000_000
+const maxRand = 10_000_000
 
 // Global precomputed randoms (read-only after init, so thread-safe)
 var rands []float64
 
 func init() {
 	rands = make([]float64, maxRand)
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(time.Now().UnixNano()/2))) // Use PCG for better quality
 	for i := range rands {
 		rands[i] = rng.Float64()
 	}
@@ -24,24 +24,19 @@ func init() {
 
 // FastRNG is a per-goroutine RNG state to avoid locking.
 type FastRNG struct {
-	idx int64
+	state uint64
 }
 
 func NewFastRNG(seed int64) *FastRNG {
-	return &FastRNG{idx: seed % int64(maxRand)}
+	return &FastRNG{state: uint64(seed)}
 }
 
-// Float64 uses precomputed pseudorandom numbers.
 func (r *FastRNG) Float64() float64 {
-	r.idx += 123456
-	r.idx *= 777777
-	r.idx %= int64(maxRand)
-	// Ensure positive index if overflow/modulo weirdness happens,
-	// though unlikely with these specific constants and int64.
-	if r.idx < 0 {
-		r.idx += int64(maxRand)
-	}
-	return rands[r.idx]
+	r.state += 0x9e3779b97f4a7c15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return float64(z^(z>>31)) / float64(1<<64-1)
 }
 
 // --- Data Structures ---
@@ -108,20 +103,10 @@ func (c *Change) IsHardBreak() bool {
 }
 
 // FixHardBreaks simulates quarantine & culprit finding of a failed run.
-func (c *Change) FixHardBreaks(testDefs []TestDefinition, rng *FastRNG) {
+func (c *Change) FixHardBreaks(testDefMap map[int]*TestDefinition, testDefs []TestDefinition, rng *FastRNG) {
 	for tid, effect := range c.Effects {
 		if effect == 0.0 {
-			var tDef *TestDefinition
-			for i := range testDefs {
-				if testDefs[i].ID == tid {
-					tDef = &testDefs[i]
-					break
-				}
-			}
-			if tDef == nil {
-				continue
-			}
-
+			tDef := testDefMap[tid]
 			// Try to fix it by resampling a non-zero pass rate
 			newEffect := 0.0
 			for i := 0; i < 10; i++ {
@@ -177,6 +162,7 @@ func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, r
 type PipelinedSubmitQueue struct {
 	// --- Configuration ---
 	TestDefs         []TestDefinition
+	TestDefM         map[int]*TestDefinition
 	AllTestIDs       []int
 	PipelineDepth    int
 	MaxMinibatchSize int
@@ -196,8 +182,15 @@ type PipelinedSubmitQueue struct {
 }
 
 func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int, rng *FastRNG) *PipelinedSubmitQueue {
+
+	testDefMap := make(map[int]*TestDefinition, len(testDefs))
+	for i := range testDefs {
+		testDefMap[testDefs[i].ID] = &testDefs[i]
+	}
+
 	sq := &PipelinedSubmitQueue{
 		TestDefs:         testDefs,
+		TestDefM:         testDefMap,
 		AllTestIDs:       make([]int, len(testDefs)),
 		RepoBasePPass:    make(map[int]float64),
 		PipelineDepth:    depth,
@@ -295,7 +288,7 @@ func (sq *PipelinedSubmitQueue) stepSpeculative(currentTick int) int {
 				// Fix hard breaks in speculated batches that we won't submit
 				for _, cl := range minibatches[i].NewChanges {
 					if cl.IsHardBreak() {
-						cl.FixHardBreaks(sq.TestDefs, sq.rng)
+						cl.FixHardBreaks(sq.TestDefM, sq.TestDefs, sq.rng)
 					}
 				}
 			}
@@ -311,7 +304,7 @@ func (sq *PipelinedSubmitQueue) stepSpeculative(currentTick int) int {
 			if res.hardFail {
 				for _, cl := range minibatches[i].NewChanges {
 					if cl.IsHardBreak() {
-						cl.FixHardBreaks(sq.TestDefs, sq.rng)
+						cl.FixHardBreaks(sq.TestDefM, sq.TestDefs, sq.rng)
 					}
 				}
 			}
@@ -395,7 +388,7 @@ func (sq *PipelinedSubmitQueue) stepParallel(currentTick int) int {
 		} else if res.hardFail {
 			for _, cl := range minibatches[i].Changes {
 				if cl.IsHardBreak() {
-					cl.FixHardBreaks(sq.TestDefs, sq.rng)
+					cl.FixHardBreaks(sq.TestDefM, sq.TestDefs, sq.rng)
 				}
 			}
 		}
