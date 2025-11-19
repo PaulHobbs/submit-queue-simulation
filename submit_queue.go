@@ -323,6 +323,7 @@ func (sq *PipelinedSubmitQueue) stepSpeculative(currentTick int) int {
 	if submittedCount > 0 {
 		sq.PendingChanges = sq.PendingChanges[submittedCount:]
 		sq.TotalSubmitted += submittedCount
+		sq.ApplyFlakyFixes(submittedCount) // speculative runs can fix flaky tests.
 	}
 
 	// Decision for next step: stay speculative only if everything passed
@@ -448,6 +449,9 @@ func (sq *PipelinedSubmitQueue) applyEffect(cl *Change, currentTick int) {
 
 // --- Simulation & Reporting ---
 
+// Android presubmit runs take about 2h. This might actually underestimate how
+// long a SQ batch would take to run since it needs tip-of-tree builds instead
+// of LKGB.
 var nChangesPer2Hour = []int{5, 5, 5, 5, 60, 60, 60, 60, 10, 10, 10, 10}
 
 const idealThroughput = 25 // per 2hour, 12.5 per h
@@ -481,22 +485,22 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 	for i := 0; i < cfg.NTests; i++ {
 		testDefs[i] = TestDefinition{
 			ID: i,
-			// Only 1% of CLs affect a test's pass rate post-smoketest (TreeHugger)
-			// This means 0.5% of CLs are "bad" (increase a test's failure rate).
-			PAffected: 0.01,
+			// Only 0.5% of CLs affect a test's pass rate post-smoketest (TreeHugger)
+			// This means 0.25% of CLs are "bad" (increase a test's failure rate).
+			PAffected: 0.005,
 			// Distribution of new pass rates after a transition
 			PassRates: []DistEntry{
 				// Allow a 50% chance for flake to randomly get fixed,
 				// in addition to the chance to purposely get fixed.
-				// See ApplyFlakyFixes
+				// See ApplyFlakyFixes for how flake gets purposely fixed.
 				{0.5, 1.0},
-				// ~40% chance of a "low flake rate" between 0.5% and 5%
-				{0.75, 0.995},
-				{0.85, 0.98},
-				{0.90, 0.95},
+				// 10% chance of a "low flake rate" between 0.5% and 5%
+				{0.55, 0.995},
+				{0.59, 0.98},
+				{0.60, 0.95},
 				// 8% chance of a "high flake rate" between 20% and 80%
-				{0.95, 0.80},
-				{0.98, 0.20},
+				{0.64, 0.80},
+				{0.68, 0.20},
 				// Some failures are breakages which can be
 				// culprit-found and quarantined. These are probably
 				// mid-air collisions between LKGB and TOT
@@ -545,7 +549,7 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 	}
 
 	mbPassRate := float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
-	avgSubmitTime := 1.0 + float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
+	avgSubmitTime := 2.0 + 2*float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
 
 	throughput := float64(submittedTotal) / float64(nIter)
 	slowdown := float64(idealThroughput*cfg.Traffic) / throughput
