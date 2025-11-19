@@ -67,11 +67,33 @@ func NewChange(id, tick int, testDefs []TestDefinition, rng *FastRNG) *Change {
 		CreationTick: tick,
 		Effects:      make(map[int]float64, len(testDefs)/10),
 	}
-	for _, td := range testDefs {
-		if rng.Float64() < td.PAffected {
-			c.Effects[td.ID] = sample(td.PassRates, rng)
+
+	// Hierarchical logic
+	// 1. A CL decides if it is a "Culprit" (Bad CL) based on a fixed rate (3%).
+	// 2. If it is a Culprit, it decides which tests it breaks.
+	//    We calculate the conditional probability needed to maintain the marginal PAffected rate.
+	//    P(TestAffected) = P(Culprit) * P(Affected | Culprit)
+	//    -> P(Affected | Culprit) = P(TestAffected) / P(Culprit)
+
+	const ProbCulprit = 0.03
+
+	if rng.Float64() < ProbCulprit {
+		for _, td := range testDefs {
+			// Calculate the probability that *this* specific test catches *this* culprit.
+			// This scales the test's sensitivity relative to the global culprit rate.
+			pCatchGivenCulprit := td.PAffected / ProbCulprit
+			if pCatchGivenCulprit > 1.0 {
+				pCatchGivenCulprit = 1.0
+			}
+
+			if rng.Float64() < pCatchGivenCulprit {
+				c.Effects[td.ID] = sample(td.PassRates, rng)
+			}
 		}
 	}
+	// If not a culprit, Effects map remains empty (CL is safe).
+	// --- CHANGED LOGIC END ---
+
 	return c
 }
 
@@ -519,8 +541,11 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 	for i := 0; i < cfg.NTests; i++ {
 		testDefs[i] = TestDefinition{
 			ID: i,
-			// Only 0.5% of CLs affect a test's pass rate post-smoketest (TreeHugger)
-			// This means 0.25% of CLs are "bad" (increase a test's failure rate).
+			// PAffected here represents the marginal probability of this test being broken
+			// by a random CL.
+			// In the new logic, this is satisfied by P(Culprit) * P(Affected|Culprit).
+			// With ProbCulprit = 3%, and PAffected = 0.5%,
+			// a Culprit CL has a ~16% chance of hitting this specific test.
 			PAffected: 0.005,
 			// Distribution of new pass rates after a transition
 			PassRates: []DistEntry{
