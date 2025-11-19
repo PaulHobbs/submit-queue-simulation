@@ -1,8 +1,8 @@
 package main
 
 import (
-	"fmt"  // Keep fmt for printing results
-	"math" // Use math/rand/v2 for better performance and thread safety
+	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -132,10 +132,13 @@ func (c *Change) FixHardBreaks(testDefMap map[int]*TestDefinition, rng *FastRNG)
 	}
 }
 
-// Minibatch keeps a subset of the pending change which can be evaluated in a run.
+// --- Minibatch Logic ---
+
 type Minibatch struct {
-	Changes    []*Change
-	NewChanges []*Change
+	Changes    []*Change // Cumulative changes in this batch
+	NewChanges []*Change // Only the new changes added at this specific stage
+	LaneID     int       // Which parallel lane is this?
+	DepthID    int       // How deep in the pipeline?
 }
 
 func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, rng *FastRNG) (bool, bool) {
@@ -167,31 +170,33 @@ func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, r
 	return passed, hardFailure
 }
 
-// PipelinedSubmitQueue keeps the state of the tests, pending changes, and minibatch statistics.
+// --- Adaptive Submit Queue ---
+
 type PipelinedSubmitQueue struct {
-	// --- Configuration ---
+	// Configuration
 	TestDefs         []TestDefinition
 	TestDefM         map[int]*TestDefinition
 	AllTestIDs       []int
-	PipelineDepth    int
+	ResourceBudget   int // Total slots (Width * Depth)
 	MaxMinibatchSize int
 
-	// --- State ---
+	// State
 	RepoBasePPass   map[int]float64
 	PendingChanges  []*Change
 	ChangeIDCounter int
-	UseParallelMode bool     // Toggle for dynamic fallback strategy
-	rng             *FastRNG // Local RNG for this queue simulation
+	rng             *FastRNG
 
-	// --- Statistics ---
+	// Adaptive State
+	FailureRateEst float64 // Exponential Moving Average of batch failure rate (0.0 to 1.0)
+
+	// Statistics
 	TotalMinibatches  int
 	PassedMinibatches int
 	TotalSubmitted    int
 	TotalWaitTicks    int // Sum of (SubmitTick - CreationTick) for all submitted CLs
 }
 
-func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int, rng *FastRNG) *PipelinedSubmitQueue {
-
+func NewPipelinedSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG) *PipelinedSubmitQueue {
 	testDefMap := make(map[int]*TestDefinition, len(testDefs))
 	for i := range testDefs {
 		testDefMap[testDefs[i].ID] = &testDefs[i]
@@ -202,11 +207,11 @@ func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int, rng *F
 		TestDefM:         testDefMap,
 		AllTestIDs:       make([]int, len(testDefs)),
 		RepoBasePPass:    make(map[int]float64),
-		PipelineDepth:    depth,
+		ResourceBudget:   resources, // e.g., 8
 		MaxMinibatchSize: maxMB,
 		PendingChanges:   make([]*Change, 0, 1024),
-		UseParallelMode:  false,
 		rng:              rng,
+		FailureRateEst:   0.0, // Start assuming smooth sailing
 	}
 	for i, t := range testDefs {
 		sq.AllTestIDs[i] = t.ID
@@ -215,12 +220,12 @@ func NewPipelinedSubmitQueue(testDefs []TestDefinition, depth, maxMB int, rng *F
 	return sq
 }
 
-// ResetStats clears the cumulative statistics, used after the priming phase.
 func (sq *PipelinedSubmitQueue) ResetStats() {
 	sq.TotalMinibatches = 0
 	sq.PassedMinibatches = 0
 	sq.TotalSubmitted = 0
 	sq.TotalWaitTicks = 0
+	// We do NOT reset FailureRateEst, as knowledge carries over
 }
 
 func (sq *PipelinedSubmitQueue) AddChanges(n, currentTick int) {
@@ -230,173 +235,222 @@ func (sq *PipelinedSubmitQueue) AddChanges(n, currentTick int) {
 	}
 }
 
+// getDimensions returns (width, depth) based on failure rate estimate.
+// The product width*depth will always be <= ResourceBudget.
+func (sq *PipelinedSubmitQueue) getDimensions() (int, int) {
+	// Mode 1: Extremely Low Failure (< 5%) -> Deep Pipeline
+	// All resources in 1 lane. Maximize batching and lookahead.
+	if sq.FailureRateEst < 0.05 {
+		return 1, sq.ResourceBudget
+	}
+
+	// Mode 2: Low Failure (5% - 20%) -> Split Pipeline
+	// e.g., if Budget=8, 2 Lanes of 4 Depth.
+	// Allows ignoring 1 bad lane while still submitting fast on the other.
+	if sq.FailureRateEst < 0.20 {
+		w := 2
+		d := sq.ResourceBudget / w
+		return w, d
+	}
+
+	// Mode 3: Medium Failure (20% - 60%) -> Wide Pipeline
+	// e.g., if Budget=8, 4 Lanes of 2 Depth.
+	// High chance of failure, so we spread bets.
+	if sq.FailureRateEst < 0.60 {
+		w := 4
+		d := sq.ResourceBudget / w
+		return w, d
+	}
+
+	// Mode 4: High Failure (> 60%) -> Full Parallel
+	// e.g., if Budget=8, 8 Lanes of 1 Depth.
+	// Maximum isolation.
+	return sq.ResourceBudget, 1
+}
+
 func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 	if len(sq.PendingChanges) == 0 {
 		return 0
 	}
-	if sq.UseParallelMode {
-		return sq.stepParallel(currentTick)
-	}
-	return sq.stepSpeculative(currentTick)
+
+	width, depth := sq.getDimensions()
+	return sq.stepAdaptive(currentTick, width, depth)
 }
 
-func (sq *PipelinedSubmitQueue) stepSpeculative(currentTick int) int {
+func (sq *PipelinedSubmitQueue) stepAdaptive(currentTick, width, depth int) int {
 	pendingCount := len(sq.PendingChanges)
 
-	// 1. Dynamic Batch Sizing
-	rawSize := int(math.Ceil(float64(pendingCount) / float64(sq.PipelineDepth)))
-	baseBatchSize := rawSize
-	if baseBatchSize < 1 {
-		baseBatchSize = 1
+	// 1. Determine Batch Sizing
+	// We need to fill 'width' lanes.
+	totalSlots := width // Effectively we are pulling 'width' independent chunks
+
+	rawSizePerLane := int(math.Ceil(float64(pendingCount) / float64(totalSlots)))
+
+	// Inside each lane, we split that chunk into 'depth' pieces
+	changesPerStage := int(math.Ceil(float64(rawSizePerLane) / float64(depth)))
+
+	if changesPerStage < 1 {
+		changesPerStage = 1
 	}
-	if baseBatchSize > sq.MaxMinibatchSize {
-		baseBatchSize = sq.MaxMinibatchSize
+	if changesPerStage > sq.MaxMinibatchSize {
+		changesPerStage = sq.MaxMinibatchSize
 	}
 
-	var minibatches []Minibatch
-	cumulativeCls := make([]*Change, 0, baseBatchSize*sq.PipelineDepth)
+	// 2. Build Batches
+	// We construct a 2D grid: batches[lane][depth]
+	minibatches := make([]Minibatch, 0, width*depth)
 
-	for i := 0; i < sq.PipelineDepth; i++ {
-		start := i * baseBatchSize
-		end := start + baseBatchSize
-		if start >= pendingCount {
-			break
+	// We keep track of which changes belong to which lane/stage to reconstruct state later
+	grid := make([][]*Minibatch, width)
+
+	cursor := 0
+	for w := 0; w < width; w++ {
+		grid[w] = make([]*Minibatch, depth)
+
+		// Accumulator for this lane (speculative pipeline)
+		var laneAccumulator []*Change
+
+		for d := 0; d < depth; d++ {
+			// Grab changes for this specific stage
+			end := cursor + changesPerStage
+			if cursor >= pendingCount {
+				// No more changes, stop building this lane
+				break
+			}
+			if end > pendingCount {
+				end = pendingCount
+			}
+
+			newChanges := sq.PendingChanges[cursor:end]
+			cursor = end
+
+			// Add to accumulator
+			laneAccumulator = append(laneAccumulator, newChanges...)
+
+			// Snapshot accumulator for this batch
+			mbChanges := make([]*Change, len(laneAccumulator))
+			copy(mbChanges, laneAccumulator)
+
+			mb := Minibatch{
+				Changes:    mbChanges,
+				NewChanges: newChanges,
+				LaneID:     w,
+				DepthID:    d,
+			}
+
+			minibatches = append(minibatches, mb)
+			// Store pointer in grid for easy lookup
+			grid[w][d] = &minibatches[len(minibatches)-1]
 		}
-		if end > pendingCount {
-			end = pendingCount
-		}
-		newClsForLevel := sq.PendingChanges[start:end]
-		cumulativeCls = append(cumulativeCls, newClsForLevel...)
-		mbChanges := make([]*Change, len(cumulativeCls))
-		copy(mbChanges, cumulativeCls)
-		minibatches = append(minibatches, Minibatch{Changes: mbChanges, NewChanges: newClsForLevel})
 	}
 
-	// 2. Evaluation
-	allPassed := true
-	results := make([]struct{ passed, hardFail bool }, len(minibatches))
-	for i, mb := range minibatches {
-		p, h := mb.Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
-		results[i] = struct{ passed, hardFail bool }{p, h}
+	// 3. Evaluate All (Parallel Execution)
+	failuresInTick := 0
+	totalInTick := 0
 
-		// Stats: Track minibatch pass rates
+	results := make(map[*Minibatch]struct{ passed, hard bool })
+
+	for i := range minibatches {
+		// Using pointer to the slice element we just appended
+		mb := &minibatches[i]
+		passed, hard := mb.Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
+		results[mb] = struct{ passed, hard bool }{passed, hard}
+
 		sq.TotalMinibatches++
-		if p {
+		totalInTick++
+		if passed {
 			sq.PassedMinibatches++
 		} else {
-			allPassed = false
+			failuresInTick++
 		}
 	}
 
-	// 3. Greedy Merging
+	// 4. Update Failure Rate Estimate (EMA)
+	currentRate := 0.0
+	if totalInTick > 0 {
+		currentRate = float64(failuresInTick) / float64(totalInTick)
+	}
+	// Alpha = 0.2 (Slowly moving average, keeps memory of recent chaos)
+	sq.FailureRateEst = 0.8*sq.FailureRateEst + 0.2*currentRate
+
+	// 5. Select Winner (Submission Logic)
+	// We prefer the "Queue Head" (Lane 0).
+	// If Lane 0 partially passes, we take the deepest pass.
+	// If Lane 0 totally fails, we check Lane 1, etc.
+	// However, if we pick Lane 1, we are effectively skipping Lane 0's changes.
+	// In a submit queue, this is valid (Lane 0 is quarantined), but we must
+	// be careful not to submit Lane 1 if it inherently depended on Lane 0.
+	// In this simulation, parallel lanes are independent.
+
 	submittedCount := 0
-	passStreakBroken := false
-	for i, res := range results {
-		if passStreakBroken {
-			if res.hardFail {
-				// Fix hard breaks in speculated batches that we won't submit
-				for _, cl := range minibatches[i].NewChanges {
-					if cl.IsHardBreak() {
-						cl.FixHardBreaks(sq.TestDefM, sq.rng)
-					}
-				}
-			}
-			continue
-		}
-		if res.passed {
-			for _, cl := range minibatches[i].NewChanges {
-				sq.applyEffect(cl, currentTick)
-			}
-			submittedCount += len(minibatches[i].NewChanges)
-		} else {
-			passStreakBroken = true
-			if res.hardFail {
-				for _, cl := range minibatches[i].NewChanges {
-					if cl.IsHardBreak() {
-						cl.FixHardBreaks(sq.TestDefM, sq.rng)
-					}
-				}
+	var winningLaneIndex = -1
+	var winningDepthIndex = -1
+
+	for w := 0; w < width; w++ {
+		// Scan from Deepest -> Shallowest
+		for d := depth - 1; d >= 0; d-- {
+			mb := grid[w][d]
+			if mb == nil {
+				continue
+			} // Slot might be empty if low on pending changes
+
+			res := results[mb]
+			if res.passed {
+				winningLaneIndex = w
+				winningDepthIndex = d
+				goto FoundWinner // Break out of both loops
 			}
 		}
+
+		// If we are here, this lane failed completely.
+		// We check the next lane (Parallel fallback).
 	}
 
-	if submittedCount > 0 {
-		sq.PendingChanges = sq.PendingChanges[submittedCount:]
+FoundWinner:
+	if winningLaneIndex != -1 {
+		// Submit the winner
+		winner := grid[winningLaneIndex][winningDepthIndex]
+
+		// Apply effects of ALL changes in the cumulative batch
+		for _, cl := range winner.Changes {
+			sq.applyEffect(cl, currentTick)
+		}
+		submittedCount = len(winner.Changes)
 		sq.TotalSubmitted += submittedCount
-		sq.ApplyFlakyFixes(submittedCount) // speculative runs can fix flaky tests.
-	}
 
-	// Decision for next step: stay speculative only if everything passed
-	sq.UseParallelMode = !allPassed
-	return submittedCount
-}
+		// Remove submitted changes from Pending
+		// We must identify exactly which CLs were submitted.
+		// Since 'PendingChanges' is linear, and our lanes sliced it linearly:
+		// We need to remove the submitted ones.
+		// The simplest way in this simulation is to rebuild PendingChanges.
 
-type TestResult struct {
-	passed, hardFail bool
-}
-
-func (sq *PipelinedSubmitQueue) stepParallel(currentTick int) int {
-	pendingCount := len(sq.PendingChanges)
-
-	// 1. Dynamic Batch Sizing (Same as speculative)
-	rawSize := int(math.Ceil(float64(pendingCount) / float64(sq.PipelineDepth)))
-	baseBatchSize := rawSize
-	if baseBatchSize < 1 {
-		baseBatchSize = 1
-	}
-	if baseBatchSize > sq.MaxMinibatchSize {
-		baseBatchSize = sq.MaxMinibatchSize
-	}
-
-	var minibatches []Minibatch
-	batchIndices := make([]struct{ start, end int }, 0, sq.PipelineDepth)
-
-	for i := 0; i < sq.PipelineDepth; i++ {
-		start := i * baseBatchSize
-		end := start + baseBatchSize
-		if start >= pendingCount {
-			break
-		}
-		if end > pendingCount {
-			end = pendingCount
+		// Identify the set of IDs submitted for fast lookup
+		submittedIDs := make(map[int]bool)
+		for _, cl := range winner.Changes {
+			submittedIDs[cl.ID] = true
 		}
 
-		// Parallel: Independent batches
-		changes := sq.PendingChanges[start:end]
-		minibatches = append(minibatches, Minibatch{Changes: changes, NewChanges: changes})
-		batchIndices = append(batchIndices, struct{ start, end int }{start, end})
-	}
-
-	// 2. Evaluation
-	allPassed := true
-	results := make([]TestResult, len(minibatches))
-	for i, mb := range minibatches {
-		p, hardFail := mb.Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
-		results[i] = TestResult{p, hardFail}
-		sq.TotalMinibatches++
-		if p {
-			sq.PassedMinibatches++
-		} else {
-			allPassed = false
-		}
-	}
-
-	// 3. Submit FIRST passing batch only
-	submittedCount := 0
-	submittedBatchIdx := -1
-	for i, res := range results {
-		if res.passed {
-			if submittedBatchIdx == -1 {
-				submittedBatchIdx = i
-				for _, cl := range minibatches[i].Changes {
-					sq.applyEffect(cl, currentTick)
-				}
-				submittedCount = len(minibatches[i].Changes)
+		newPending := make([]*Change, 0, len(sq.PendingChanges)-submittedCount)
+		for _, cl := range sq.PendingChanges {
+			if !submittedIDs[cl.ID] {
+				newPending = append(newPending, cl)
 			}
-			// We don't submit subsequent passing batches in this mode,
-			// but they don't need hard-fixes either.
-		} else if res.hardFail {
-			for _, cl := range minibatches[i].Changes {
+		}
+		sq.PendingChanges = newPending
+
+		sq.ApplyFlakyFixes(submittedCount)
+	}
+
+	// 6. Hard Fail Fixes (Culprit Finding)
+	// We apply fixes to ANY Hard Failures found in ANY batch executed this tick.
+	// Even if we didn't submit them, the "Run" happened, so the "Logs" exist.
+	for i := range minibatches {
+		mb := &minibatches[i]
+		res := results[mb]
+		if res.hard {
+			// Fix hard breaks in the *new* changes of this batch.
+			// (Cumulative changes from previous stages were already fixed or are being fixed by their own stage's run)
+			for _, cl := range mb.NewChanges {
 				if cl.IsHardBreak() {
 					cl.FixHardBreaks(sq.TestDefM, sq.rng)
 				}
@@ -404,31 +458,12 @@ func (sq *PipelinedSubmitQueue) stepParallel(currentTick int) int {
 		}
 	}
 
-	if submittedCount > 0 {
-		sq.TotalSubmitted += submittedCount
-		start := batchIndices[submittedBatchIdx].start
-		end := batchIndices[submittedBatchIdx].end
-		newPending := make([]*Change, 0, len(sq.PendingChanges)-submittedCount)
-		newPending = append(newPending, sq.PendingChanges[:start]...)
-		newPending = append(newPending, sq.PendingChanges[end:]...)
-		sq.PendingChanges = newPending
-		sq.ApplyFlakyFixes(submittedCount)
-	}
-
-	// Decision for next step: return to speculative only if ALL parallel batches passed.
-	// (This is a strict criterion, but appropriate if we want to avoid "flapping" between modes)
-	sq.UseParallelMode = !allPassed
 	return submittedCount
 }
 
-// ApplyFlakyFixes assumes that highly-flaky tests get fixed or demoted with per
-// CL submitted with likelihood proportional to their failure rate (severity).
 func (sq *PipelinedSubmitQueue) ApplyFlakyFixes(n int) {
 	for t, passRate := range sq.RepoBasePPass {
-		// Each CL has an independent chance; we can use Pow to simulate this.
-		// Assume a baseline of ~1w to fix a 1% flaky test, which is 8400 CLs
-		// So divide by n by 84 to scale appropriately.
-		if sq.rng.Float64() > math.Pow(passRate, float64(n)/84) {
+		if sq.rng.Float64() > math.Pow(passRate, float64(n)/84.0) {
 			sq.RepoBasePPass[t] = 1
 		}
 	}
@@ -457,22 +492,21 @@ var nChangesPer2Hour = []int{5, 5, 5, 5, 60, 60, 60, 60, 10, 10, 10, 10}
 const idealThroughput = 25 // per 2hour, 12.5 per h
 const nSamples = 100
 
-// SimConfig defines the parameters for one simulation run.
 type SimConfig struct {
-	SeqID       int // For ordered output
-	Parallelism int
-	Traffic     int
-	NTests      int
-	MaxBatch    int
+	SeqID     int
+	Resources int // Budget (e.g. 8)
+	Traffic   int
+	NTests    int
+	MaxBatch  int
 }
 
-// SimResult holds the results of one simulation run.
 type SimResult struct {
 	Config        SimConfig
 	Slowdown      float64
 	AvgQueueSize  float64
 	MBPassRate    float64
 	AvgSubmitTime float64
+	FinalFailEst  float64 // To see if it adapted correctly
 }
 
 func runSimulation(cfg SimConfig, seed int64) SimResult {
@@ -509,8 +543,7 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		}
 	}
 
-	sq := NewPipelinedSubmitQueue(testDefs, cfg.Parallelism, cfg.MaxBatch, rng)
-
+	sq := NewPipelinedSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng)
 	// Initial load
 	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
 
@@ -533,26 +566,44 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 			totalQ += len(sq.PendingChanges)
 		}
 
-		// Apply load (identical logic for both phases)
 		qSize := len(sq.PendingChanges)
 		changesToAdd := cfg.Traffic * nChangesPer2Hour[i%12]
+
+		// Backpressure Simulation (Throttle ingress if queue explodes)
 		if qSize >= 200 && qSize < 400 {
 			changesToAdd /= 2
-		} else if qSize >= 400 && qSize < 800 {
+		}
+		if qSize >= 400 && qSize < 800 {
 			changesToAdd /= 4
-		} else if qSize >= 800 {
+		}
+		if qSize >= 800 {
 			changesToAdd /= 8
 		}
+
 		if changesToAdd > 0 {
 			sq.AddChanges(changesToAdd, i)
 		}
 	}
 
-	mbPassRate := float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
-	avgSubmitTime := 2.0 + 2*float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
+	mbPassRate := 0.0
+	if sq.TotalMinibatches > 0 {
+		mbPassRate = float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
+	}
 
-	throughput := float64(submittedTotal) / float64(nIter)
-	slowdown := float64(idealThroughput*cfg.Traffic) / throughput
+	avgSubmitTime := 0.0
+	if sq.TotalSubmitted > 0 {
+		avgSubmitTime = 2.0 + 2*float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
+	}
+
+	throughput := 0.0
+	if nIter > 0 {
+		throughput = float64(submittedTotal) / float64(nIter)
+	}
+
+	slowdown := math.Inf(1)
+	if throughput > 0 {
+		slowdown = float64(idealThroughput*cfg.Traffic) / throughput
+	}
 
 	return SimResult{
 		Config:        cfg,
@@ -560,15 +611,15 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		AvgQueueSize:  float64(totalQ) / float64(nIter),
 		MBPassRate:    mbPassRate,
 		AvgSubmitTime: avgSubmitTime,
+		FinalFailEst:  sq.FailureRateEst,
 	}
 }
 
 // runAveragedSimulation performs nSamples of the simulation and returns averaged results.
 func runAveragedSimulation(cfg SimConfig) SimResult {
-	var sumSlowdown, sumQSize, sumMBPassRate, sumSubmitTime float64
+	var sumSlowdown, sumQSize, sumMBPassRate, sumSubmitTime, sumFailEst float64
 
 	for i := 0; i < nSamples; i++ {
-		// Generate a unique seed for every sample of every config
 		seed := int64((cfg.SeqID*nSamples + i) * 997)
 		res := runSimulation(cfg, seed)
 
@@ -576,6 +627,7 @@ func runAveragedSimulation(cfg SimConfig) SimResult {
 		sumQSize += res.AvgQueueSize
 		sumMBPassRate += res.MBPassRate
 		sumSubmitTime += res.AvgSubmitTime
+		sumFailEst += res.FinalFailEst
 	}
 
 	return SimResult{
@@ -584,28 +636,28 @@ func runAveragedSimulation(cfg SimConfig) SimResult {
 		AvgQueueSize:  sumQSize / float64(nSamples),
 		MBPassRate:    sumMBPassRate / float64(nSamples),
 		AvgSubmitTime: sumSubmitTime / float64(nSamples),
+		FinalFailEst:  sumFailEst / float64(nSamples),
 	}
 }
 
 // printIncremental handles the stateful header printing and the result row.
 func printIncremental(res SimResult, lastCfg *SimConfig) {
 	cfg := res.Config
-	// Print headers if major parameters changed compared to the last printed result
-	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism {
-		fmt.Printf("Pipeline depth/parallelism: %d\n", cfg.Parallelism)
+	if lastCfg == nil || cfg.Resources != lastCfg.Resources {
+		fmt.Printf("Resource Budget (Execution Slots): %d\n", cfg.Resources)
 	}
-	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic {
-		fmt.Printf("\nIdeal throughput: %d CLs/2hour = Productivity 1/1x \n", idealThroughput*cfg.Traffic)
-		fmt.Printf("%-10s | %-22s | %-14s | %-9s | %s\n",
-			"Max Batch", "Productivity * 1/x", "Avg Queue Size", "Pass Rate", "Avg Time to Submit (h)")
-		fmt.Println("-------------------------------------------------------------------------------------------------------------")
+	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic {
+		fmt.Printf("\nIdeal throughput: %d CLs/2hour\n", idealThroughput*cfg.Traffic)
+		fmt.Printf("%-10s | %-12s | %-14s | %-9s | %-10s | %s\n",
+			"Max Batch", "Slowdown", "Avg Queue", "Pass Rate", "Fail Est", "Avg Time (h)")
+		fmt.Println("-----------------------------------------------------------------------------------------")
 	}
-	if lastCfg == nil || cfg.Parallelism != lastCfg.Parallelism || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
+	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
 		fmt.Printf("n_tests: %d\n", cfg.NTests)
 	}
 
-	fmt.Printf("%-10d | %-22.2f | %-14.0f | %-9.2f | %.2f\n",
-		cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, res.AvgSubmitTime)
+	fmt.Printf("%-10d | %-12.2f | %-14.0f | %-9.2f | %-10.2f | %.2f\n",
+		cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, res.FinalFailEst, res.AvgSubmitTime)
 }
 
 func main() {
@@ -642,24 +694,26 @@ func main() {
 
 	// 2. Spawn all simulations
 	seqCounter := 0
-	for _, parallelism := range []int{2, 4, 8} {
-		for _, traffic := range []int{1, 2} {
-			for _, nTests := range []int{16, 32, 64} {
-				for _, maxBatch := range []int{32, 64, 128} {
-					wg.Add(1)
-					cfg := SimConfig{
-						SeqID:       seqCounter,
-						Parallelism: parallelism,
-						Traffic:     traffic,
-						NTests:      nTests,
-						MaxBatch:    maxBatch,
-					}
-					go func(c SimConfig) {
-						defer wg.Done()
-						resultsCh <- runAveragedSimulation(c)
-					}(cfg)
-					seqCounter++
+	// We test with a Resource Budget of 8 (simulating 8 machines/executors)
+	// This matches your description of switching between 1x8, 2x4, 4x2, 8x1
+	resources := 8
+
+	for _, traffic := range []int{1, 2} {
+		for _, nTests := range []int{16, 32, 64} {
+			for _, maxBatch := range []int{32, 64, 128} {
+				wg.Add(1)
+				cfg := SimConfig{
+					SeqID:     seqCounter,
+					Resources: resources,
+					Traffic:   traffic,
+					NTests:    nTests,
+					MaxBatch:  maxBatch,
 				}
+				go func(c SimConfig) {
+					defer wg.Done()
+					resultsCh <- runAveragedSimulation(c)
+				}(cfg)
+				seqCounter++
 			}
 		}
 	}
