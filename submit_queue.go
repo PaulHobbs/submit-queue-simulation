@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math"
 	"sync"
@@ -163,9 +164,10 @@ type Minibatch struct {
 	DepthID    int       // How deep in the pipeline?
 }
 
-func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, rng *FastRNG) (bool, bool) {
+func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, rng *FastRNG) (bool, bool, []int) {
 	passed := true
 	hardFailure := false
+	var failedTests []int
 
 	for _, tid := range allTestIDs {
 		effP := 1.0
@@ -184,12 +186,11 @@ func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, r
 		}
 		if effP < 1.0 && rng.Float64() >= effP {
 			passed = false
-			if hardFailure {
-				break
-			}
+			failedTests = append(failedTests, tid)
+			// Remove break to find all failing tests for scoring
 		}
 	}
-	return passed, hardFailure
+	return passed, hardFailure, failedTests
 }
 
 // --- Adaptive Submit Queue ---
@@ -201,6 +202,7 @@ type PipelinedSubmitQueue struct {
 	AllTestIDs       []int
 	ResourceBudget   int // Total slots (Width * Depth)
 	MaxMinibatchSize int
+	WeightedScoring  bool
 
 	// State
 	RepoBasePPass   map[int]float64
@@ -218,7 +220,7 @@ type PipelinedSubmitQueue struct {
 	TotalWaitTicks    int // Sum of (SubmitTick - CreationTick) for all submitted CLs
 }
 
-func NewPipelinedSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG) *PipelinedSubmitQueue {
+func NewPipelinedSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, weightedScoring bool) *PipelinedSubmitQueue {
 	testDefMap := make(map[int]*TestDefinition, len(testDefs))
 	for i := range testDefs {
 		testDefMap[testDefs[i].ID] = &testDefs[i]
@@ -234,6 +236,7 @@ func NewPipelinedSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rn
 		PendingChanges:   make([]*Change, 0, 1024),
 		rng:              rng,
 		FailureRateEst:   0.0, // Start assuming smooth sailing
+		WeightedScoring:  weightedScoring,
 	}
 	for i, t := range testDefs {
 		sq.AllTestIDs[i] = t.ID
@@ -325,7 +328,7 @@ func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 		for x := 0; x < k; x++ {
 			randIdx := x + int(sq.rng.Float64()*float64(t-x))
 			indices[x], indices[randIdx] = indices[randIdx], indices[x]
-			
+
 			// Assign CL to batch indices[x]
 			bIdx := indices[x]
 			minibatches[bIdx].Changes = append(minibatches[bIdx].Changes, cl)
@@ -335,16 +338,16 @@ func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 
 	// 4. Evaluate Batches
 	batchResults := make([]bool, t) // true = pass, false = fail
+	batchWeights := make([]float64, t) // weight of the failure (0.0 if passed)
+
 	failuresInTick := 0
 	var hardFailCLs []*Change // Collect CLs that caused hard failures to fix them later
 
 	for i := range minibatches {
-		// Evaluate returns (passed, hardFailure)
-		// We treat hardFailure same as regular failure for the boolean vector y
-		passed, hard := minibatches[i].Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
-		
+		// Evaluate returns (passed, hardFailure, failedTests)
+		passed, hard, failedTests := minibatches[i].Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
+
 		// Fix hard breaks: Defer to after evaluation to simulate parallel execution
-		// (Prevent side-effects from affecting other batches in the same tick)
 		if hard {
 			for _, cl := range minibatches[i].Changes {
 				if cl.IsHardBreak() {
@@ -354,11 +357,37 @@ func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 		}
 
 		batchResults[i] = passed
-		sq.TotalMinibatches++
+		sq.TotalMinibatches++ // Always increment total
 		if passed {
 			sq.PassedMinibatches++
+			batchWeights[i] = 0.0
 		} else {
 			failuresInTick++
+
+			if sq.WeightedScoring {
+				// Weighted Scoring:
+				// Weight = Reliability of the MOST reliable test that failed.
+				// Reliability = RepoBasePPass (higher = more reliable).
+				// If a 99% reliable test fails, weight is 0.99.
+				// If a 50% reliable test fails, weight is 0.50.
+				maxReliability := 0.0
+				for _, tid := range failedTests {
+					if rel, ok := sq.RepoBasePPass[tid]; ok {
+						if rel > maxReliability {
+							maxReliability = rel
+						}
+					} else {
+						// Default to 1.0 if unknown (assume reliable)
+						if 1.0 > maxReliability {
+							maxReliability = 1.0
+						}
+					}
+				}
+				batchWeights[i] = maxReliability
+			} else {
+				// Standard Scoring: All failures count as 1.0
+				batchWeights[i] = 1.0
+			}
 		}
 	}
 
@@ -382,17 +411,15 @@ func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 	// 5. Decode / Scoring
 	// Score Sj = (Sum of failing batches CL j is in) / k
 	rejectedIndices := make(map[int]bool)
-	
+
 	for j := 0; j < n; j++ {
-		failCount := 0
+		totalWeight := 0.0
 		for _, bIdx := range clBatchMap[j] {
-			if !batchResults[bIdx] {
-				failCount++
-			}
+			totalWeight += batchWeights[bIdx]
 		}
-		
-		score := float64(failCount) / float64(k)
-		
+
+		score := totalWeight / float64(k)
+
 		// Decision: Reject if Score > Threshold
 		// Doc suggests > 0.8 for primary culprit.
 		// We use 0.75 as a safe cutoff given k=5 or 6.
@@ -403,11 +430,11 @@ func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 
 	// 6. Submit or Reject
 	submittedCount := 0
-	
+
 	// We need to reconstruct PendingChanges removing BOTH submitted and rejected.
 	// In this design, "Rejected" CLs are removed from the queue (failed).
 	// "Submitted" CLs are applied and removed.
-	
+
 	// Apply effects for submitted
 	for j, cl := range batchChanges {
 		if !rejectedIndices[j] {
@@ -416,7 +443,7 @@ func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
 		}
 	}
 	sq.TotalSubmitted += submittedCount
-	
+
 	// Apply flaky fixes based on submitted count
 	if submittedCount > 0 {
 		sq.ApplyFlakyFixes(submittedCount)
@@ -463,11 +490,12 @@ const idealThroughput = 25 // per 2hour, 12.5 per h
 const nSamples = 100
 
 type SimConfig struct {
-	SeqID     int
-	Resources int // Budget (e.g. 8)
-	Traffic   int
-	NTests    int
-	MaxBatch  int
+	SeqID           int
+	Resources       int // Budget (e.g. 8)
+	Traffic         int
+	NTests          int
+	MaxBatch        int
+	WeightedScoring bool
 }
 
 type SimResult struct {
@@ -516,7 +544,7 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		}
 	}
 
-	sq := NewPipelinedSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng)
+	sq := NewPipelinedSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.WeightedScoring)
 	// Initial load
 	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
 
@@ -634,6 +662,9 @@ func printIncremental(res SimResult, lastCfg *SimConfig) {
 }
 
 func main() {
+	weightedPtr := flag.Bool("weighted-scoring", false, "Enable weighted scoring based on test reliability")
+	flag.Parse()
+
 	resultsCh := make(chan SimResult, 100)
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -671,16 +702,17 @@ func main() {
 	// This matches your description of switching between 1x8, 2x4, 4x2, 8x1
 	resources := 8
 
-	for _, traffic := range []int{1, 2} {
-		for _, nTests := range []int{16, 32, 64} {
-			for _, maxBatch := range []int{32, 64, 128} {
+	for _, traffic := range []int{1, 2, 4, 8} {
+		for _, nTests := range []int{16, 32, 64, 128} {
+			for _, maxBatch := range []int{128, 256, 512} {
 				wg.Add(1)
 				cfg := SimConfig{
-					SeqID:     seqCounter,
-					Resources: resources,
-					Traffic:   traffic,
-					NTests:    nTests,
-					MaxBatch:  maxBatch,
+					SeqID:           seqCounter,
+					Resources:       resources,
+					Traffic:         traffic,
+					NTests:          nTests,
+					MaxBatch:        maxBatch,
+					WeightedScoring: *weightedPtr,
 				}
 				go func(c SimConfig) {
 					defer wg.Done()
