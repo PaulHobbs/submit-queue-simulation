@@ -257,129 +257,104 @@ func (sq *PipelinedSubmitQueue) AddChanges(n, currentTick int) {
 	}
 }
 
-// getDimensions returns (width, depth) based on failure rate estimate.
-// The product width*depth will always be <= ResourceBudget.
-func (sq *PipelinedSubmitQueue) getDimensions() (int, int) {
-	// Mode 1: Extremely Low Failure (< 5%) -> Deep Pipeline
-	// All resources in 1 lane. Maximize batching and lookahead.
-	if sq.FailureRateEst < 0.05 {
-		return 1, sq.ResourceBudget
-	}
-
-	// Mode 2: Low Failure (5% - 20%) -> Split Pipeline
-	// e.g., if Budget=8, 2 Lanes of 4 Depth.
-	// Allows ignoring 1 bad lane while still submitting fast on the other.
-	if sq.FailureRateEst < 0.20 {
-		w := 2
-		d := sq.ResourceBudget / w
-		return w, d
-	}
-
-	// Mode 3: Medium Failure (20% - 60%) -> Wide Pipeline
-	// e.g., if Budget=8, 4 Lanes of 2 Depth.
-	// High chance of failure, so we spread bets.
-	if sq.FailureRateEst < 0.60 {
-		w := 4
-		d := sq.ResourceBudget / w
-		return w, d
-	}
-
-	// Mode 4: High Failure (> 60%) -> Full Parallel
-	// e.g., if Budget=8, 8 Lanes of 1 Depth.
-	// Maximum isolation.
-	return sq.ResourceBudget, 1
-}
-
+// Step performs one iteration of the Sparse Bernoulli queue processing.
 func (sq *PipelinedSubmitQueue) Step(currentTick int) int {
-	if len(sq.PendingChanges) == 0 {
+	pendingCount := len(sq.PendingChanges)
+	if pendingCount == 0 {
 		return 0
 	}
 
-	width, depth := sq.getDimensions()
-	return sq.stepAdaptive(currentTick, width, depth)
-}
-
-func (sq *PipelinedSubmitQueue) stepAdaptive(currentTick, width, depth int) int {
-	pendingCount := len(sq.PendingChanges)
-
-	// 1. Determine Batch Sizing
-	// We need to fill 'width' lanes.
-	totalSlots := width // Effectively we are pulling 'width' independent chunks
-
-	rawSizePerLane := int(math.Ceil(float64(pendingCount) / float64(totalSlots)))
-
-	// Inside each lane, we split that chunk into 'depth' pieces
-	changesPerStage := int(math.Ceil(float64(rawSizePerLane) / float64(depth)))
-
-	if changesPerStage < 1 {
-		changesPerStage = 1
+	// 1. Determine Batch Sizing (N)
+	// We take up to MaxMinibatchSize from the pending queue.
+	n := pendingCount
+	if n > sq.MaxMinibatchSize {
+		n = sq.MaxMinibatchSize
 	}
-	if changesPerStage > sq.MaxMinibatchSize {
-		changesPerStage = sq.MaxMinibatchSize
+	batchChanges := sq.PendingChanges[:n]
+
+	// 2. Sparse Bernoulli Parameters
+	// T: Number of minibatches. Scale logarithmically with N.
+	// Baseline: T ~ 10 * log10(N).
+	// We clamp T to be at least a reasonable number to allow triangulation.
+	tFloat := 10.0 * math.Log10(float64(n))
+	t := int(math.Ceil(tFloat))
+	if t < 4 {
+		t = 4 // Minimum batches to have some discrimination
 	}
 
-	// 2. Build Batches
-	// We construct a 2D grid: batches[lane][depth]
-	minibatches := make([]Minibatch, 0, width*depth)
+	// k: Weight (minibatches per CL).
+	// Optimal k approx T / (d + 1). Assuming d=2 (expected culprits).
+	d := 2.0
+	k := int(math.Round(float64(t) / (d + 1)))
+	// Practical constraints:
+	if k < 1 {
+		k = 1
+	}
+	if k >= t {
+		k = t - 1 // Cannot be in all batches (would offer no discrimination vs others)
+	}
+	if k > 6 {
+		k = 6 // Cap weight to prevent saturation as per doc recommendation
+	}
 
-	// We keep track of which changes belong to which lane/stage to reconstruct state later
-	grid := make([][]*Minibatch, width)
-
-	cursor := 0
-	for w := 0; w < width; w++ {
-		grid[w] = make([]*Minibatch, depth)
-
-		// Accumulator for this lane (speculative pipeline)
-		var laneAccumulator []*Change
-
-		for d := 0; d < depth; d++ {
-			// Grab changes for this specific stage
-			end := cursor + changesPerStage
-			if cursor >= pendingCount {
-				// No more changes, stop building this lane
-				break
-			}
-			if end > pendingCount {
-				end = pendingCount
-			}
-
-			newChanges := sq.PendingChanges[cursor:end]
-			cursor = end
-
-			// Add to accumulator
-			laneAccumulator = append(laneAccumulator, newChanges...)
-
-			// Snapshot accumulator for this batch
-			mbChanges := make([]*Change, len(laneAccumulator))
-			copy(mbChanges, laneAccumulator)
-
-			mb := Minibatch{
-				Changes:    mbChanges,
-				NewChanges: newChanges,
-				LaneID:     w,
-				DepthID:    d,
-			}
-
-			minibatches = append(minibatches, mb)
-			// Store pointer in grid for easy lookup
-			grid[w][d] = &minibatches[len(minibatches)-1]
+	// 3. Construct Encoding Matrix and Batches
+	// We need T minibatches.
+	minibatches := make([]Minibatch, t)
+	for i := range minibatches {
+		minibatches[i] = Minibatch{
+			Changes: make([]*Change, 0, n/2), // heuristic cap
+			// NewChanges not strictly used in this logic but kept for struct compatibility
+			NewChanges: nil,
+			LaneID:     i,
+			DepthID:    0,
 		}
 	}
 
-	// 3. Evaluate All (Parallel Execution)
-	failuresInTick := 0
-	totalInTick := 0
+	// Matrix M[t][n] implicitly defined by which batches each CL is added to.
+	// We track which batches each CL is in for scoring later.
+	clBatchMap := make([][]int, n) // cl_index -> list of batch_indices
 
-	results := make(map[*Minibatch]struct{ passed, hard bool })
+	for j, cl := range batchChanges {
+		// Select k unique batches for this CL
+		// We use Fisher-Yates shuffle on an index array to pick k unique
+		indices := make([]int, t)
+		for x := 0; x < t; x++ {
+			indices[x] = x
+		}
+		// Partial shuffle to get first k
+		for x := 0; x < k; x++ {
+			randIdx := x + int(sq.rng.Float64()*float64(t-x))
+			indices[x], indices[randIdx] = indices[randIdx], indices[x]
+			
+			// Assign CL to batch indices[x]
+			bIdx := indices[x]
+			minibatches[bIdx].Changes = append(minibatches[bIdx].Changes, cl)
+			clBatchMap[j] = append(clBatchMap[j], bIdx)
+		}
+	}
+
+	// 4. Evaluate Batches
+	batchResults := make([]bool, t) // true = pass, false = fail
+	failuresInTick := 0
+	var hardFailCLs []*Change // Collect CLs that caused hard failures to fix them later
 
 	for i := range minibatches {
-		// Using pointer to the slice element we just appended
-		mb := &minibatches[i]
-		passed, hard := mb.Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
-		results[mb] = struct{ passed, hard bool }{passed, hard}
+		// Evaluate returns (passed, hardFailure)
+		// We treat hardFailure same as regular failure for the boolean vector y
+		passed, hard := minibatches[i].Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
+		
+		// Fix hard breaks: Defer to after evaluation to simulate parallel execution
+		// (Prevent side-effects from affecting other batches in the same tick)
+		if hard {
+			for _, cl := range minibatches[i].Changes {
+				if cl.IsHardBreak() {
+					hardFailCLs = append(hardFailCLs, cl)
+				}
+			}
+		}
 
+		batchResults[i] = passed
 		sq.TotalMinibatches++
-		totalInTick++
 		if passed {
 			sq.PassedMinibatches++
 		} else {
@@ -387,98 +362,71 @@ func (sq *PipelinedSubmitQueue) stepAdaptive(currentTick, width, depth int) int 
 		}
 	}
 
-	// 4. Update Failure Rate Estimate (EMA)
-	currentRate := 0.0
-	if totalInTick > 0 {
-		currentRate = float64(failuresInTick) / float64(totalInTick)
+	// Fix Hard Failures now that all batches have "run"
+	// Deduplicate in case multiple batches found the same hard break
+	fixedCLs := make(map[int]bool)
+	for _, cl := range hardFailCLs {
+		if !fixedCLs[cl.ID] {
+			cl.FixHardBreaks(sq.TestDefM, sq.rng)
+			fixedCLs[cl.ID] = true
+		}
 	}
-	// Alpha = 0.2 (Slowly moving average, keeps memory of recent chaos)
+
+	// Update global failure rate estimate (EMA)
+	currentRate := 0.0
+	if t > 0 {
+		currentRate = float64(failuresInTick) / float64(t)
+	}
 	sq.FailureRateEst = 0.8*sq.FailureRateEst + 0.2*currentRate
 
-	// 5. Select Winner (Submission Logic)
-	// We prefer the "Queue Head" (Lane 0).
-	// If Lane 0 partially passes, we take the deepest pass.
-	// If Lane 0 totally fails, we check Lane 1, etc.
-	// However, if we pick Lane 1, we are effectively skipping Lane 0's changes.
-	// In a submit queue, this is valid (Lane 0 is quarantined), but we must
-	// be careful not to submit Lane 1 if it inherently depended on Lane 0.
-	// In this simulation, parallel lanes are independent.
-
-	submittedCount := 0
-	var winningLaneIndex = -1
-	var winningDepthIndex = -1
-
-	for w := 0; w < width; w++ {
-		// Scan from Deepest -> Shallowest
-		for d := depth - 1; d >= 0; d-- {
-			mb := grid[w][d]
-			if mb == nil {
-				continue
-			} // Slot might be empty if low on pending changes
-
-			res := results[mb]
-			if res.passed {
-				winningLaneIndex = w
-				winningDepthIndex = d
-				goto FoundWinner // Break out of both loops
+	// 5. Decode / Scoring
+	// Score Sj = (Sum of failing batches CL j is in) / k
+	rejectedIndices := make(map[int]bool)
+	
+	for j := 0; j < n; j++ {
+		failCount := 0
+		for _, bIdx := range clBatchMap[j] {
+			if !batchResults[bIdx] {
+				failCount++
 			}
 		}
-
-		// If we are here, this lane failed completely.
-		// We check the next lane (Parallel fallback).
+		
+		score := float64(failCount) / float64(k)
+		
+		// Decision: Reject if Score > Threshold
+		// Doc suggests > 0.8 for primary culprit.
+		// We use 0.75 as a safe cutoff given k=5 or 6.
+		if score > 0.75 {
+			rejectedIndices[j] = true
+		}
 	}
 
-FoundWinner:
-	if winningLaneIndex != -1 {
-		// Submit the winner
-		winner := grid[winningLaneIndex][winningDepthIndex]
-
-		// Apply effects of ALL changes in the cumulative batch
-		for _, cl := range winner.Changes {
+	// 6. Submit or Reject
+	submittedCount := 0
+	
+	// We need to reconstruct PendingChanges removing BOTH submitted and rejected.
+	// In this design, "Rejected" CLs are removed from the queue (failed).
+	// "Submitted" CLs are applied and removed.
+	
+	// Apply effects for submitted
+	for j, cl := range batchChanges {
+		if !rejectedIndices[j] {
 			sq.applyEffect(cl, currentTick)
+			submittedCount++
 		}
-		submittedCount = len(winner.Changes)
-		sq.TotalSubmitted += submittedCount
-
-		// Remove submitted changes from Pending
-		// We must identify exactly which CLs were submitted.
-		// Since 'PendingChanges' is linear, and our lanes sliced it linearly:
-		// We need to remove the submitted ones.
-		// The simplest way in this simulation is to rebuild PendingChanges.
-
-		// Identify the set of IDs submitted for fast lookup
-		submittedIDs := make(map[int]bool)
-		for _, cl := range winner.Changes {
-			submittedIDs[cl.ID] = true
-		}
-
-		newPending := make([]*Change, 0, len(sq.PendingChanges)-submittedCount)
-		for _, cl := range sq.PendingChanges {
-			if !submittedIDs[cl.ID] {
-				newPending = append(newPending, cl)
-			}
-		}
-		sq.PendingChanges = newPending
-
+	}
+	sq.TotalSubmitted += submittedCount
+	
+	// Apply flaky fixes based on submitted count
+	if submittedCount > 0 {
 		sq.ApplyFlakyFixes(submittedCount)
 	}
 
-	// 6. Hard Fail Fixes (Culprit Finding)
-	// We apply fixes to ANY Hard Failures found in ANY batch executed this tick.
-	// Even if we didn't submit them, the "Run" happened, so the "Logs" exist.
-	for i := range minibatches {
-		mb := &minibatches[i]
-		res := results[mb]
-		if res.hard {
-			// Fix hard breaks in the *new* changes of this batch.
-			// (Cumulative changes from previous stages were already fixed or are being fixed by their own stage's run)
-			for _, cl := range mb.NewChanges {
-				if cl.IsHardBreak() {
-					cl.FixHardBreaks(sq.TestDefM, sq.rng)
-				}
-			}
-		}
-	}
+	// Remove processed CLs (both submitted and rejected) from pending
+	// Since we processed the first 'n', we just slice them off.
+	// Wait! If we processed them, they are either Submitted (success) or Rejected (fail).
+	// In either case, they leave the Pending Queue.
+	sq.PendingChanges = sq.PendingChanges[n:]
 
 	return submittedCount
 }
