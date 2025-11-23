@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+const ProbCulprit = 0.03
+const FlakeTolerance = 0.05
+
 // --- RNG & Basic Structures (Unchanged) ---
 
 type FastRNG struct {
@@ -76,7 +79,6 @@ func NewChange(id, tick int, testDefs []TestDefinition, rng *FastRNG) *Change {
 	}
 
 	// 3% chance to be a "Culprit" (Bad CL)
-	const ProbCulprit = 0.03
 
 	if rng.Float64() < ProbCulprit {
 		for _, td := range testDefs {
@@ -136,7 +138,6 @@ type CulpritQueueSubmitQueue struct {
 	TestDefs         []TestDefinition
 	AllTestIDs       []int
 	ResourceBudget   int // N: Number of parallel batches
-	RedundancyK      int // K: Number of batches each CL is assigned to
 	MaxMinibatchSize int
 
 	// State
@@ -162,27 +163,11 @@ func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int,
 		AllTestIDs:       make([]int, len(testDefs)),
 		RepoBasePPass:    make(map[int]float64),
 		ResourceBudget:   resources, // This is N
-		RedundancyK:      4,         // K (Definite Defectives redundancy)
 		MaxMinibatchSize: maxMB,
 		PendingChanges:   make([]*Change, 0, 1024),
 		VerificationQueue: make([]*Change, 0, 1024),
 		FixingQueue:       make([]*Change, 0, 1024),
 		rng:              rng,
-	}
-
-	// Adjust K if N is small
-	K := sq.RedundancyK
-	N := sq.ResourceBudget
-	if N > 0 && K > N {
-		K = int(N / 2)
-	}
-	// Ensure we don't drop below K=2 unless N is very small, 
-	// otherwise intersection logic is weak.
-	if N >= 2 && K < 2 {
-		K = 2
-	}
-	if K < 1 {
-		K = 1
 	}
 
 	for i, t := range testDefs {
@@ -208,18 +193,14 @@ func (sq *CulpritQueueSubmitQueue) AddChanges(n, currentTick int) {
 	}
 }
 
-// pickDistinct selects k distinct integers from range [0, n)
-func pickDistinct(n, k int, rng *FastRNG) []int {
-	indices := make([]int, n)
-	for i := 0; i < n; i++ {
-		indices[i] = i
+func pickBernoulli(N int, p float64, rng *FastRNG) []int {
+	indices := make([]int, 0, int(float64(N)*p)+1)
+	for i := 0; i < N; i++ {
+		if rng.Float64() < p {
+			indices = append(indices, i)
+		}
 	}
-	// Fisher-Yates shuffle partial
-	for i := 0; i < k; i++ {
-		j := i + int(rng.Float64()*float64(n-i))
-		indices[i], indices[j] = indices[j], indices[i]
-	}
-	return indices[:k]
+	return indices
 }
 
 // IsCulprit checks if the change actually breaks a test (Hard Failure).
@@ -304,25 +285,14 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	sq.processFixingQueue(currentTick)
 	verifiedSubmitted, _ := sq.processVerificationQueue(currentTick)
 
-	N := sq.ResourceBudget  // - int(float32(activeVerifications) / 16)
-	K := sq.RedundancyK
-
-	if N > 0 && K > N {  // Clamp K to be at most N / 2.
-		K = int(N / 2)
-	}
-	// Ensure we don't drop below K=2 unless N is very small, 
-	// otherwise intersection logic is weak.
-	if N >= 2 && K < 2 {
-		K = 2
-	}
-	if K < 1 {
-		K = 1
-	}
-
 	// 1. Select Candidate CLs
-	limit := N * sq.MaxMinibatchSize
+	limit := sq.MaxMinibatchSize
 	if limit > len(sq.PendingChanges) {
 		limit = len(sq.PendingChanges)
+	}
+	N := int(float32(limit) / 2) // sq.ResourceBudget  // - int(float32(activeVerifications) / 16)
+	if N == 0 {
+		N = sq.ResourceBudget
 	}
 
 	// If no resources or no changes, just handle verified
@@ -336,23 +306,28 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	}
 
 	activeCLs := sq.PendingChanges[:limit]
+	K := 5
+	// Ensure we don't drop below K=2 unless N is very small, 
+	// otherwise intersection logic is weak.
+	if K >= N {
+		K = N - 2
+	}
+	if N >= 2 && K < 2 {
+		K = 2
+	}
+	if K < 1 {
+		K = 1
+	}
 
 	// 2. Sparse Assignment with Orthogonality Check
 	batches := make([][]*Change, N)
 	clAssignments := make(map[*Change][]int, len(activeCLs))
-	
-	// Keep track of what we assigned to ensure separation
-	assignedHistory := make([][]int, 0, len(activeCLs))
+
+	p := float64(K) / float64(N)
 
 	for _, cl := range activeCLs {
 		cl.State = StateInBatch
-		
-		// NEW: Use pickSeparated instead of pickDistinct
-		assignedIndices := pickSeparated(N, K, sq.rng, assignedHistory)
-		
-		// Store for future comparisons
-		assignedHistory = append(assignedHistory, assignedIndices)
-		
+		assignedIndices := pickBernoulli(N, p, sq.rng)
 		clAssignments[cl] = assignedIndices
 		for _, batchIdx := range assignedIndices {
 			batches[batchIdx] = append(batches[batchIdx], cl)
@@ -645,12 +620,12 @@ func main() {
 	}()
 
 	seqCounter := 0
-	// We simulate N=8 * traffic parallel batches.
-	resources := 32
+	// We allow for up to N=resources * traffic parallel batches.
+	resources := 4
 
-	for _, traffic := range []int{4, 8, 16} {
-		for _, nTests := range []int{16, 32, 64} {
-			for _, maxBatch := range []int{1024} {
+	for _, traffic := range []int{8} {
+		for _, nTests := range []int{32} {
+			for _, maxBatch := range []int{64, 128, 256} {
 				wg.Add(1)
 				cfg := SimConfig{
 					SeqID:     seqCounter,
@@ -675,62 +650,4 @@ func main() {
 
 	<-printDone
 	fmt.Printf("\nAll CulpritQueue simulations complete in %v.\n", time.Since(start))
-}
-
-// computeOverlap calculates how many batches two assignments share.
-// Assumes sorted inputs for O(K) efficiency, but for small K, O(K^2) is negligible.
-func computeOverlap(a, b []int) int {
-	count := 0
-	// Since K is small (4-8), nested loop is faster than allocating maps
-	for _, valA := range a {
-		for _, valB := range b {
-			if valA == valB {
-				count++
-				break // Optimization: move to next valA
-			}
-		}
-	}
-	return count
-}
-
-// pickSeparated tries to find a set of K indices that overlaps as little as possible
-// with any existing assignment in currentBatchAssignments.
-func pickSeparated(N, K int, rng *FastRNG, existingAssignments [][]int) []int {
-	const MaxRetries = 20
-	
-	var bestAssignment []int
-	minMaxOverlap := K + 1 // Start higher than possible
-
-	for try := 0; try < MaxRetries; try++ {
-		// Generate candidate
-		candidate := pickDistinct(N, K, rng)
-		
-		// Check against neighbors
-		currentMaxOverlap := 0
-		for _, other := range existingAssignments {
-			overlap := computeOverlap(candidate, other)
-			if overlap > currentMaxOverlap {
-				currentMaxOverlap = overlap
-			}
-			// Pruning: If we already found a bad overlap, this candidate is useless
-			// unless it's better than our global best, but usually we just want "Good Enough"
-			if currentMaxOverlap >= minMaxOverlap {
-				break
-			}
-		}
-
-		// Perfect case: Overlap is 0 or 1.
-		// (Overlap 1 is usually acceptable and unavoidable in sparse designs).
-		if currentMaxOverlap <= 1 {
-			return candidate
-		}
-
-		// Keep track of the best we've seen so far (fallback)
-		if currentMaxOverlap < minMaxOverlap {
-			minMaxOverlap = currentMaxOverlap
-			bestAssignment = candidate
-		}
-	}
-	
-	return bestAssignment
 }
