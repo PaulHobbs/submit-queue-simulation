@@ -1,0 +1,35 @@
+CulpritQueue Resources (N Batches): 128
+
+Ideal throughput: 100 CLs/2hour
+Max Batch  | Slowdown     | Avg Queue      | Pass Rate | Victim%   | Runs/CL    | Avg Time (h)
+---------------------------------------------------------------------------------------------
+n_tests: 16
+1024       | 1.00         | 0              | 0.78      | 0.388     | 1.28       | 4.04
+n_tests: 32
+1024       | 1.00         | 0              | 0.76      | 0.339     | 1.28       | 4.04
+n_tests: 64
+1024       | 1.00         | 0              | 0.84      | 0.166     | 1.28       | 3.98
+CulpritQueue Resources (N Batches): 256
+
+Ideal throughput: 200 CLs/2hour
+Max Batch  | Slowdown     | Avg Queue      | Pass Rate | Victim%   | Runs/CL    | Avg Time (h)
+---------------------------------------------------------------------------------------------
+n_tests: 16
+1024       | 1.00         | 0              | 0.80      | 0.354     | 1.28       | 4.03
+n_tests: 32
+1024       | 1.00         | 0              | 0.77      | 0.311     | 1.28       | 4.02
+n_tests: 64
+1024       | 1.00         | 0              | 0.84      | 0.154     | 1.28       | 3.97
+CulpritQueue Resources (N Batches): 512
+
+Ideal throughput: 400 CLs/2hour
+Max Batch  | Slowdown     | Avg Queue      | Pass Rate | Victim%   | Runs/CL    | Avg Time (h)
+---------------------------------------------------------------------------------------------
+n_tests: 16
+1024       | 1.00         | 0              | 0.82      | 0.265     | 1.28       | 4.00
+n_tests: 32
+1024       | 1.00         | 0              | 0.79      | 0.255     | 1.28       | 4.00
+n_tests: 64
+1024       | 1.00         | 0              | 0.85      | 0.123     | 1.28       | 3.97
+
+All CulpritQueue simulations complete in 3m54.957826917s.
