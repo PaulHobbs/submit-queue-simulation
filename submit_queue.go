@@ -125,7 +125,7 @@ func GetCachedMatrix(rows, cols, weight int, optimize bool) *Matrix {
 	// based on the key if we wanted, but here we just need *a* good matrix.
 	mat := NewMatrix(rows, cols, weight)
 	if optimize {
-		mat.Optimize(0.1) // Spend up to 0.1s optimizing this matrix configuration
+		mat.Optimize(1)
 	}
 	
 	matrixCache.Store(key, mat)
@@ -166,11 +166,8 @@ func (m *Matrix) randomizeColumn(colIdx int) {
 }
 
 // Optimize runs the Greedy Swap / Electron Repulsion algorithm
-func (m *Matrix) Optimize(seconds float64) {
-	startTime := time.Now()
-	timeout := time.Duration(seconds * float64(time.Second))
-
-	for time.Since(startTime) < timeout {
+func (m *Matrix) Optimize(iterations int) {
+	for i := 0; i < iterations; i++ {
 		maxOverlap, worstPair := m.MaxOverlap()
 		if maxOverlap <= 1 {
 			// Theoretical optimum reached for most sparse matrices
@@ -181,7 +178,7 @@ func (m *Matrix) Optimize(seconds float64) {
 		colB := worstPair[1]
 
 		// Find collisions
-		collisionRows := m.findCollisions(colA, colB)
+		collisionRows := m.findCollisionRows(colA, colB)
 		if len(collisionRows) == 0 {
 			continue
 		}
@@ -204,6 +201,139 @@ func (m *Matrix) Optimize(seconds float64) {
 	}
 }
 
+// OptimizeHighDensity runs a more advanced optimization algorithm for potentially higher density matrices.
+func (m *Matrix) OptimizeHighDensity(iterations int) {
+	numCols := m.NumItems // 100
+
+	// To break out of local minima
+	stagnationCounter := 0
+
+	// Track global best to know when to stop or re-roll
+	currentMaxOverlap, _ := m.MaxOverlap()
+
+	for i := 0; i < iterations; i++ {
+		// 1. Pick a random pivot column
+		colA := rand.Intn(numCols)
+
+		// 2. Find the WORST enemy of colA (Linear scan O(C))
+		colB, maxLocalOverlap := m.findWorstNeighbor(colA)
+
+		// OPTIMIZATION: Adaptive Threshold
+		// If colA's worst situation is already better than our global average/target,
+		// don't waste time fixing it. Pick a different random column.
+		if maxLocalOverlap < currentMaxOverlap-1 {
+			continue
+		}
+
+		// 3. Attempt to fix colA relative to colB
+		improved := m.attemptTargetedSwap(colA, colB, maxLocalOverlap)
+
+		if improved {
+			// Update our knowledge of the global state lazily
+			stagnationCounter = 0
+		} else {
+			stagnationCounter++
+		}
+
+		// 4. Anti-Stagnation: If we can't improve, shake the matrix
+		// With high density, we get stuck in local optima easily.
+		if stagnationCounter > numCols*2 {
+			m.randomizeColumn(rand.Intn(numCols)) // Nuke a random column
+			stagnationCounter = 0
+			// Re-calculate global baseline
+			currentMaxOverlap, _ = m.MaxOverlap()
+		}
+	}
+}
+
+// findWorstNeighbor scans all columns to find who hurts colIdx the most.
+// Complexity: O(C) - very fast for C=100
+func (m *Matrix) findWorstNeighbor(colIdx int) (int, int) {
+	worstCol := -1
+	maxO := -1
+
+	for j := 0; j < m.NumItems; j++ {
+		if colIdx == j {
+			continue
+		}
+		// Inline overlap calc for speed
+		overlap := 0
+		for k := 0; k < m.RowChunks; k++ {
+			overlap += bits.OnesCount64(m.Cols[colIdx][k] & m.Cols[j][k])
+		}
+
+		if overlap > maxO {
+			maxO = overlap
+			worstCol = j
+		}
+	}
+	return worstCol, maxO
+}
+
+// attemptTargetedSwap tries to move a bit from colA that collides with colB
+// to a spot that doesn't create a WORSE collision with someone else.
+func (m *Matrix) attemptTargetedSwap(colA, colB, oldOverlap int) bool {
+	// 1. Identify colliding rows (Candidates to REMOVE)
+	collisions := m.findCollisionRows(colA, colB)
+	if len(collisions) == 0 {
+		return false
+	}
+
+	// 2. Identify empty rows in A (Candidates to ADD)
+	empties := m.findEmptyRows(colA)
+	if len(empties) == 0 {
+		return false
+	}
+
+	// 3. Try X random swaps to see if one improves the score
+	currentScore := oldOverlap
+
+	for attempt := 0; attempt < 5; attempt++ {
+		rowOut := collisions[rand.Intn(len(collisions))]
+		rowIn := empties[rand.Intn(len(empties))]
+
+		// Provisional Flip
+		m.flipBit(colA, rowOut, 0)
+		m.flipBit(colA, rowIn, 1)
+
+		// Check new Max Overlap for A
+		_, newMaxOverlap := m.findWorstNeighbor(colA)
+
+		if newMaxOverlap < currentScore {
+			// We found an improvement! Keep it.
+			return true
+		}
+
+		// Revert
+		m.flipBit(colA, rowIn, 0)
+		m.flipBit(colA, rowOut, 1)
+	}
+
+	return false
+}
+
+func (m *Matrix) findEmptyRows(colIdx int) []int {
+	// Pre-allocating for performance assuming ~60% empty
+	empties := make([]int, 0, m.NumTests/2)
+
+	for k := 0; k < m.RowChunks; k++ {
+		// If chunk is all 1s (unlikely but possible), skip
+		if m.Cols[colIdx][k] == ^uint64(0) {
+			continue
+		}
+		for bit := 0; bit < 64; bit++ {
+			rowAbs := k*64 + bit
+			if rowAbs >= m.NumTests {
+				break
+			}
+			if (m.Cols[colIdx][k] & (uint64(1) << bit)) == 0 {
+				empties = append(empties, rowAbs)
+			}
+		}
+	}
+	return empties
+}
+
 func (m *Matrix) MaxOverlap() (int, [2]int) {
 	maxVal := 0
 	pair := [2]int{0, 0}
@@ -222,7 +352,8 @@ func (m *Matrix) MaxOverlap() (int, [2]int) {
 	return maxVal, pair
 }
 
-func (m *Matrix) findCollisions(idxA, idxB int) []int {
+// findCollisionRows finds rows where both colA and colB have a bit set.
+func (m *Matrix) findCollisionRows(idxA, idxB int) []int {
 	var collisions []int
 	for k := 0; k < m.RowChunks; k++ {
 		common := m.Cols[idxA][k] & m.Cols[idxB][k]
