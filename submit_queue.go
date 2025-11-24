@@ -10,7 +10,7 @@ import (
 )
 
 const ProbCulprit = 0.03
-const FlakeTolerance = 0.05
+const FlakeTolerance = 0.10
 
 // --- RNG & Basic Structures (Unchanged) ---
 
@@ -101,6 +101,7 @@ type MatrixKey struct {
 	Rows   int
 	Cols   int
 	Weight int
+	Optimize bool
 }
 
 var matrixCache sync.Map // Thread-safe memoization
@@ -114,8 +115,8 @@ type Matrix struct {
 	RowChunks int
 }
 
-func GetCachedMatrix(rows, cols, weight int) *Matrix {
-	key := MatrixKey{rows, cols, weight}
+func GetCachedMatrix(rows, cols, weight int, optimize bool) *Matrix {
+	key := MatrixKey{rows, cols, weight, optimize}
 	if val, ok := matrixCache.Load(key); ok {
 		return val.(*Matrix)
 	}
@@ -124,7 +125,9 @@ func GetCachedMatrix(rows, cols, weight int) *Matrix {
 	// We use a fresh RNG for matrix generation to ensure deterministic structure 
 	// based on the key if we wanted, but here we just need *a* good matrix.
 	mat := NewMatrix(rows, cols, weight)
-	mat.Optimize(0.1) // Spend up to 0.1s optimizing this matrix configuration
+	if optimize {
+		mat.Optimize(0.1) // Spend up to 0.1s optimizing this matrix configuration
+	}
 	
 	matrixCache.Store(key, mat)
 	return mat
@@ -320,9 +323,13 @@ type CulpritQueueSubmitQueue struct {
 	AllTestIDs       []int
 	ResourceBudget   int // N: Number of parallel batches
 	MaxMinibatchSize int
+	UseOptimizedMatrix bool
+	MaxK             int
+	KDivisor         int
 
 	// State
 	RepoBasePPass      map[int]float64
+	PostsubmitFailureRate map[int]float64
 	PendingChanges     []*Change
 	VerificationQueue  []*Change
 	FixingQueue        []*Change
@@ -338,22 +345,27 @@ type CulpritQueueSubmitQueue struct {
 	TotalVictims       int
 }
 
-func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG) *CulpritQueueSubmitQueue {
+func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, useOptimizedMatrix bool, maxK, kDivisor int) *CulpritQueueSubmitQueue {
 	sq := &CulpritQueueSubmitQueue{
 		TestDefs:          testDefs,
 		AllTestIDs:        make([]int, len(testDefs)),
 		RepoBasePPass:     make(map[int]float64),
+		PostsubmitFailureRate: make(map[int]float64),
 		ResourceBudget:    resources, // This is N
 		MaxMinibatchSize:  maxMB,
 		PendingChanges:    make([]*Change, 0, 1024),
 		VerificationQueue: make([]*Change, 0, 1024),
 		FixingQueue:       make([]*Change, 0, 1024),
 		rng:               rng,
+		UseOptimizedMatrix: useOptimizedMatrix,
+		MaxK:              maxK,
+		KDivisor:          kDivisor,
 	}
 
 	for i, t := range testDefs {
 		sq.AllTestIDs[i] = t.ID
 		sq.RepoBasePPass[t.ID] = 1.0
+		sq.PostsubmitFailureRate[t.ID] = 0.0
 	}
 	return sq
 }
@@ -372,6 +384,16 @@ func (sq *CulpritQueueSubmitQueue) AddChanges(n, currentTick int) {
 		sq.PendingChanges = append(sq.PendingChanges, NewChange(sq.ChangeIDCounter, currentTick, sq.TestDefs, sq.rng))
 		sq.ChangeIDCounter++
 	}
+}
+
+func (sq *CulpritQueueSubmitQueue) getActiveTestIDs() []int {
+	active := make([]int, 0, len(sq.AllTestIDs))
+	for _, tid := range sq.AllTestIDs {
+		if sq.PostsubmitFailureRate[tid] <= FlakeTolerance {
+			active = append(active, tid)
+		}
+	}
+	return active
 }
 
 // IsCulprit checks if the change actually breaks a test (Hard Failure).
@@ -399,6 +421,8 @@ func (sq *CulpritQueueSubmitQueue) processVerificationQueue(currentTick int) ([]
 		}
 	}
 
+	activeTestIDs := sq.getActiveTestIDs()
+
 	for _, cl := range sq.VerificationQueue {
 		// Start verification if resources allow
 		if cl.State == StateSuspect {
@@ -414,7 +438,7 @@ func (sq *CulpritQueueSubmitQueue) processVerificationQueue(currentTick int) ([]
 			if currentTick >= cl.VerifyDoneTick {
 				// Verification Complete: Run Isolated Test
 				mb := Minibatch{Changes: []*Change{cl}}
-				passed, _ := mb.Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
+				passed, _ := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
 
 				if passed {
 					cl.State = StateSubmitted
@@ -482,9 +506,9 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	activeCLs := sq.PendingChanges[:limit]
 	
 	// Determine Sparsity K
-	K := 6
-	if K >= int(float32(N) / 12) {
-		K =int(float32(N) / 12) 
+	K := sq.MaxK
+	if K >= int(float32(N) / float32(sq.KDivisor)) {
+		K = int(float32(N) / float32(sq.KDivisor))
 	}
 	if N >= 2 && K < 2 {
 		K = 2
@@ -499,7 +523,7 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	// Cols = MaxMinibatchSize (We generate a matrix wide enough for max load)
 	// Weight = K
 	
-	optMatrix := GetCachedMatrix(N, sq.MaxMinibatchSize, K)
+	optMatrix := GetCachedMatrix(N, sq.MaxMinibatchSize, K, sq.UseOptimizedMatrix)
 	
 	batches := make([][]*Change, N)
 	clAssignments := make(map[*Change][]int, len(activeCLs))
@@ -520,10 +544,12 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	}
 
 	// 3. Execute Batches (Parallel)
+	activeTestIDs := sq.getActiveTestIDs()
+
 	batchPassed := make([]bool, N)
 	for i := 0; i < N; i++ {
 		mb := Minibatch{Changes: batches[i]}
-		passed, _ := mb.Evaluate(sq.RepoBasePPass, sq.AllTestIDs, sq.rng)
+		passed, _ := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
 		batchPassed[i] = passed
 		
 		sq.TotalMinibatches++
@@ -575,6 +601,10 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	sq.TotalSubmitted += len(submittedChanges)
 	sq.ApplyFlakyFixes(len(submittedChanges))
 
+	if len(submittedChanges) > 0 {
+		sq.runPostsubmit()
+	}
+
 	return len(submittedChanges)
 }
 
@@ -584,6 +614,28 @@ func (sq *CulpritQueueSubmitQueue) ApplyFlakyFixes(n int) {
 		if sq.rng.Float64() > math.Pow(passRate, float64(n)/84.0) {
 			sq.RepoBasePPass[t] = 1
 		}
+	}
+}
+
+func (sq *CulpritQueueSubmitQueue) runPostsubmit() {
+	const alpha = 0.05
+	for _, tid := range sq.AllTestIDs {
+		p := 1.0
+		if val, ok := sq.RepoBasePPass[tid]; ok {
+			p = val
+		}
+
+		passed := true
+		if p < 1.0 && sq.rng.Float64() >= p {
+			passed = false
+		}
+
+		observed := 0.0
+		if !passed {
+			observed = 1.0
+		}
+
+		sq.PostsubmitFailureRate[tid] = alpha*observed + (1-alpha)*sq.PostsubmitFailureRate[tid]
 	}
 }
 
@@ -607,7 +659,7 @@ func (sq *CulpritQueueSubmitQueue) applyEffect(cl *Change, currentTick int) {
 var nChangesPer2Hour = []int{5, 5, 5, 5, 60, 60, 60, 60, 10, 10, 10, 10}
 
 const idealThroughput = 25 
-const nSamples = 1
+const nSamples = 100
 
 type SimConfig struct {
 	SeqID     int
@@ -615,6 +667,9 @@ type SimConfig struct {
 	Traffic   int
 	NTests    int
 	MaxBatch  int
+	UseOptimizedMatrix bool
+	MaxK      int
+	KDivisor  int
 }
 
 type SimResult struct {
@@ -649,7 +704,7 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		}
 	}
 
-	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng)
+	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor)
 	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
 
 	totalQ := 0
@@ -760,16 +815,16 @@ func printIncremental(res SimResult, lastCfg *SimConfig) {
 	}
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic {
 		fmt.Printf("\nIdeal throughput: %d CLs/2hour\n", idealThroughput*cfg.Traffic)
-		fmt.Printf("%-10s | %-12s | %-14s | %-9s | %-9s | %-10s | %s\n",
-			"Max Batch", "Slowdown", "Avg Queue", "Pass Rate", "Victim%", "Runs/CL", "Avg Time (h)")
-		fmt.Println("---------------------------------------------------------------------------------------------")
+		fmt.Printf("%-10s | %-5s | %-5s | %-10s | %-12s | %-14s | %-9s | %-9s | %-10s | %s\n",
+			"Optimized", "MaxK", "Div", "Max Batch", "Slowdown", "Avg Queue", "Pass Rate", "Victim%", "Runs/CL", "Avg Time (h)")
+		fmt.Println("------------------------------------------------------------------------------------------------------------------------")
 	}
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
 		fmt.Printf("n_tests: %d\n", cfg.NTests)
 	}
 
-	fmt.Printf("%-10d | %-12.2f | %-14.0f | %-9.2f | %-9.1f | %-10.2f | %.2f\n",
-		cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, 100 * res.VictimRate, res.AvgRunsPerSubmitted, res.AvgSubmitTime)
+	fmt.Printf("%-10v | %-5d | %-5d | %-10d | %-12.2f | %-14.0f | %-9.2f | %-9.1f | %-10.2f | %.2f\n",
+		cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, 100 * res.VictimRate, res.AvgRunsPerSubmitted, res.AvgSubmitTime)
 }
 
 func main() {
@@ -805,21 +860,30 @@ func main() {
 	resources := 4
 
 	for _, traffic := range []int{8} {
-		for _, nTests := range []int{32} {
-			for _, maxBatch := range []int{2048} {
-				wg.Add(1)
-				cfg := SimConfig{
-					SeqID:     seqCounter,
-					Resources: resources * traffic,
-					Traffic:   traffic,
-					NTests:    nTests,
-					MaxBatch:  maxBatch,
+		for _, optimized := range []bool{true} {
+			for _, nTests := range []int{32} {
+				for _, maxBatch := range []int{2048} {
+					for _, maxK := range []int{10,11,12,13,14} {
+						for _, kDiv := range []int{4,5,6} {
+							wg.Add(1)
+							cfg := SimConfig{
+								SeqID:              seqCounter,
+								Resources:          resources * traffic,
+								Traffic:            traffic,
+								NTests:             nTests,
+								MaxBatch:           maxBatch,
+								UseOptimizedMatrix: optimized,
+								MaxK:               maxK,
+								KDivisor:           kDiv,
+							}
+							go func(c SimConfig) {
+								defer wg.Done()
+								resultsCh <- runAveragedSimulation(c)
+							}(cfg)
+							seqCounter++
+						}
+					}
 				}
-				go func(c SimConfig) {
-					defer wg.Done()
-					resultsCh <- runAveragedSimulation(c)
-				}(cfg)
-				seqCounter++
 			}
 		}
 	}
