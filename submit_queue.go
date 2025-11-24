@@ -10,7 +10,6 @@ import (
 )
 
 const ProbCulprit = 0.03
-const FlakeTolerance = 0.10
 
 // --- RNG & Basic Structures (Unchanged) ---
 
@@ -285,15 +284,13 @@ type Minibatch struct {
 	Changes []*Change
 }
 
-func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, rng *FastRNG) (bool, bool) {
+func (mb *Minibatch) Evaluate(repoBasePPass []float64, allTestIDs []int, rng *FastRNG) (bool, bool, []int) {
 	passed := true
 	hardFailure := false
+	var failedTests []int
 
 	for _, tid := range allTestIDs {
-		effP := 1.0
-		if base, ok := repoBasePPass[tid]; ok {
-			effP = base
-		}
+		effP := repoBasePPass[tid]
 		for _, cl := range mb.Changes {
 			if eff, ok := cl.Effects[tid]; ok {
 				if eff < effP {
@@ -307,12 +304,13 @@ func (mb *Minibatch) Evaluate(repoBasePPass map[int]float64, allTestIDs []int, r
 		// Determine if test passes based on effective probability
 		if effP < 1.0 && rng.Float64() >= effP {
 			passed = false
+			failedTests = append(failedTests, tid)
 			if hardFailure {
 				break
 			}
 		}
 	}
-	return passed, hardFailure
+	return passed, hardFailure, failedTests
 }
 
 // --- CulpritQueue Submit Queue (Sparse Parallel Group Testing) ---
@@ -326,10 +324,12 @@ type CulpritQueueSubmitQueue struct {
 	UseOptimizedMatrix bool
 	MaxK             int
 	KDivisor         int
+	FlakeTolerance   float64
 
 	// State
-	RepoBasePPass      map[int]float64
-	PostsubmitFailureRate map[int]float64
+	RepoBasePPass      []float64
+	PostsubmitFailureRate []float64
+	activeTestIDs      []int
 	PendingChanges     []*Change
 	VerificationQueue  []*Change
 	FixingQueue        []*Change
@@ -345,12 +345,13 @@ type CulpritQueueSubmitQueue struct {
 	TotalVictims       int
 }
 
-func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, useOptimizedMatrix bool, maxK, kDivisor int) *CulpritQueueSubmitQueue {
+func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, useOptimizedMatrix bool, maxK, kDivisor int, flakeTolerance float64) *CulpritQueueSubmitQueue {
 	sq := &CulpritQueueSubmitQueue{
 		TestDefs:          testDefs,
 		AllTestIDs:        make([]int, len(testDefs)),
-		RepoBasePPass:     make(map[int]float64),
-		PostsubmitFailureRate: make(map[int]float64),
+		RepoBasePPass:     make([]float64, len(testDefs)),
+		PostsubmitFailureRate: make([]float64, len(testDefs)),
+		activeTestIDs:     make([]int, 0, len(testDefs)),
 		ResourceBudget:    resources, // This is N
 		MaxMinibatchSize:  maxMB,
 		PendingChanges:    make([]*Change, 0, 1024),
@@ -360,12 +361,14 @@ func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int,
 		UseOptimizedMatrix: useOptimizedMatrix,
 		MaxK:              maxK,
 		KDivisor:          kDivisor,
+		FlakeTolerance:    flakeTolerance,
 	}
 
 	for i, t := range testDefs {
 		sq.AllTestIDs[i] = t.ID
 		sq.RepoBasePPass[t.ID] = 1.0
 		sq.PostsubmitFailureRate[t.ID] = 0.0
+		sq.activeTestIDs = append(sq.activeTestIDs, t.ID)
 	}
 	return sq
 }
@@ -387,13 +390,12 @@ func (sq *CulpritQueueSubmitQueue) AddChanges(n, currentTick int) {
 }
 
 func (sq *CulpritQueueSubmitQueue) getActiveTestIDs() []int {
-	active := make([]int, 0, len(sq.AllTestIDs))
-	for _, tid := range sq.AllTestIDs {
-		if sq.PostsubmitFailureRate[tid] <= FlakeTolerance {
-			active = append(active, tid)
-		}
-	}
-	return active
+	return sq.activeTestIDs
+}
+
+func (sq *CulpritQueueSubmitQueue) updateFailureRate(tid int, observed float64) {
+	const alpha = 0.05
+	sq.PostsubmitFailureRate[tid] = alpha*observed + (1-alpha)*sq.PostsubmitFailureRate[tid]
 }
 
 // IsCulprit checks if the change actually breaks a test (Hard Failure).
@@ -438,7 +440,7 @@ func (sq *CulpritQueueSubmitQueue) processVerificationQueue(currentTick int) ([]
 			if currentTick >= cl.VerifyDoneTick {
 				// Verification Complete: Run Isolated Test
 				mb := Minibatch{Changes: []*Change{cl}}
-				passed, _ := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
+				passed, _, _ := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
 
 				if passed {
 					cl.State = StateSubmitted
@@ -547,10 +549,13 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	activeTestIDs := sq.getActiveTestIDs()
 
 	batchPassed := make([]bool, N)
+	batchFailedTests := make([][]int, N)
+
 	for i := 0; i < N; i++ {
 		mb := Minibatch{Changes: batches[i]}
-		passed, _ := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
+		passed, _, failedTests := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
 		batchPassed[i] = passed
+		batchFailedTests[i] = failedTests
 		
 		sq.TotalMinibatches++
 		if passed {
@@ -601,6 +606,40 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	sq.TotalSubmitted += len(submittedChanges)
 	sq.ApplyFlakyFixes(len(submittedChanges))
 
+	// Update stats from innocent batches (all CLs submitted)
+	if len(submittedChanges) > 0 {
+		submittedSet := make(map[int]bool, len(submittedChanges))
+		for _, cl := range submittedChanges {
+			submittedSet[cl.ID] = true
+		}
+
+		for i := 0; i < N; i++ {
+			if len(batches[i]) == 0 {
+				continue
+			}
+			allInnocent := true
+			for _, cl := range batches[i] {
+				if !submittedSet[cl.ID] {
+					allInnocent = false
+					break
+				}
+			}
+			if allInnocent {
+				failedMap := make(map[int]bool)
+				for _, tid := range batchFailedTests[i] {
+					failedMap[tid] = true
+				}
+				for _, tid := range activeTestIDs {
+					observed := 0.0
+					if failedMap[tid] {
+						observed = 1.0
+					}
+					sq.updateFailureRate(tid, observed)
+				}
+			}
+		}
+	}
+
 	if len(submittedChanges) > 0 {
 		sq.runPostsubmit()
 	}
@@ -618,12 +657,11 @@ func (sq *CulpritQueueSubmitQueue) ApplyFlakyFixes(n int) {
 }
 
 func (sq *CulpritQueueSubmitQueue) runPostsubmit() {
-	const alpha = 0.05
+	
+	newActive := make([]int, 0, len(sq.AllTestIDs))
+	
 	for _, tid := range sq.AllTestIDs {
-		p := 1.0
-		if val, ok := sq.RepoBasePPass[tid]; ok {
-			p = val
-		}
+		p := sq.RepoBasePPass[tid]
 
 		passed := true
 		if p < 1.0 && sq.rng.Float64() >= p {
@@ -635,16 +673,18 @@ func (sq *CulpritQueueSubmitQueue) runPostsubmit() {
 			observed = 1.0
 		}
 
-		sq.PostsubmitFailureRate[tid] = alpha*observed + (1-alpha)*sq.PostsubmitFailureRate[tid]
+		sq.updateFailureRate(tid, observed)
+		
+		if sq.PostsubmitFailureRate[tid] <= sq.FlakeTolerance {
+			newActive = append(newActive, tid)
+		}
 	}
+	sq.activeTestIDs = newActive
 }
 
 func (sq *CulpritQueueSubmitQueue) applyEffect(cl *Change, currentTick int) {
 	for tid, effect := range cl.Effects {
 		current := sq.RepoBasePPass[tid]
-		if _, ok := sq.RepoBasePPass[tid]; !ok {
-			current = 1.0
-		}
 		// We simulate that if a bad change lands, the repo stays broken
 		// until fixed.
 		if effect < current {
@@ -670,6 +710,7 @@ type SimConfig struct {
 	UseOptimizedMatrix bool
 	MaxK      int
 	KDivisor  int
+	FlakeTolerance float64
 }
 
 type SimResult struct {
@@ -704,7 +745,7 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		}
 	}
 
-	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor)
+	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance)
 	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
 
 	totalQ := 0
@@ -815,16 +856,16 @@ func printIncremental(res SimResult, lastCfg *SimConfig) {
 	}
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic {
 		fmt.Printf("\nIdeal throughput: %d CLs/2hour\n", idealThroughput*cfg.Traffic)
-		fmt.Printf("%-10s | %-5s | %-5s | %-10s | %-12s | %-14s | %-9s | %-9s | %-10s | %s\n",
-			"Optimized", "MaxK", "Div", "Max Batch", "Slowdown", "Avg Queue", "Pass Rate", "Victim%", "Runs/CL", "Avg Time (h)")
-		fmt.Println("------------------------------------------------------------------------------------------------------------------------")
+		fmt.Printf("%-10s | %-5s | %-5s | %-5s | %-10s | %-12s | %-14s | %-9s | %-9s | %-10s | %s\n",
+			"Optimized", "MaxK", "Div", "Flake", "Max Batch", "Slowdown", "Avg Queue", "Pass Rate", "Victim%", "Runs/CL", "Avg Time (h)")
+		fmt.Println("-----------------------------------------------------------------------------------------------------------------------------------")
 	}
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
 		fmt.Printf("n_tests: %d\n", cfg.NTests)
 	}
 
-	fmt.Printf("%-10v | %-5d | %-5d | %-10d | %-12.2f | %-14.0f | %-9.2f | %-9.1f | %-10.2f | %.2f\n",
-		cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, 100 * res.VictimRate, res.AvgRunsPerSubmitted, res.AvgSubmitTime)
+	fmt.Printf("%-10v | %-5d | %-5d | %-5.2f | %-10d | %-12.2f | %-14.0f | %-9.2f | %-9.1f | %-10.2f | %.2f\n",
+		cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance, cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, 100 * res.VictimRate, res.AvgRunsPerSubmitted, res.AvgSubmitTime)
 }
 
 func main() {
@@ -863,24 +904,27 @@ func main() {
 		for _, optimized := range []bool{true} {
 			for _, nTests := range []int{32} {
 				for _, maxBatch := range []int{2048} {
-					for _, maxK := range []int{10,11,12,13,14} {
-						for _, kDiv := range []int{4,5,6} {
-							wg.Add(1)
-							cfg := SimConfig{
-								SeqID:              seqCounter,
-								Resources:          resources * traffic,
-								Traffic:            traffic,
-								NTests:             nTests,
-								MaxBatch:           maxBatch,
-								UseOptimizedMatrix: optimized,
-								MaxK:               maxK,
-								KDivisor:           kDiv,
+					for _, maxK := range []int{12} {
+						for _, kDiv := range []int{5} {
+							for _, flakeTol := range []float64{0.05, 0.10, 0.15} {
+								wg.Add(1)
+								cfg := SimConfig{
+									SeqID:              seqCounter,
+									Resources:          resources * traffic,
+									Traffic:            traffic,
+									NTests:             nTests,
+									MaxBatch:           maxBatch,
+									UseOptimizedMatrix: optimized,
+									MaxK:               maxK,
+									KDivisor:           kDiv,
+									FlakeTolerance:     flakeTol,
+								}
+								go func(c SimConfig) {
+									defer wg.Done()
+									resultsCh <- runAveragedSimulation(c)
+								}(cfg)
+								seqCounter++
 							}
-							go func(c SimConfig) {
-								defer wg.Done()
-								resultsCh <- runAveragedSimulation(c)
-							}(cfg)
-							seqCounter++
 						}
 					}
 				}
