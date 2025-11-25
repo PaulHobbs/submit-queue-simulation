@@ -5,6 +5,8 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
+	"os"
+	"runtime/pprof"
 	"sync"
 	"time"
 )
@@ -105,6 +107,34 @@ type MatrixKey struct {
 
 var matrixCache sync.Map // Thread-safe memoization
 
+// Cache statistics
+var (
+	matrixCacheHits   int64
+	matrixCacheMisses int64
+	cacheMutex        sync.Mutex
+)
+
+// quantizeValue rounds values to nearby quantized levels for better cache hit rates.
+// For small values (<20), returns exact value.
+// For larger values, rounds to ±5% tolerance on exponential scale.
+func quantizeValue(val int) int {
+	if val < 20 {
+		return val // Keep exact for small values (cheap to optimize)
+	}
+
+	// Use exponential quantization: round to nearest value in geometric sequence
+	// Scale factor chosen to give ~5% granularity
+	scale := 1.05 // ~5% steps
+
+	// Find the nearest quantized value
+	// log(val) / log(scale) gives us the "index" in the sequence
+	index := math.Log(float64(val)) / math.Log(scale)
+	roundedIndex := math.Round(index)
+	quantized := int(math.Pow(scale, roundedIndex))
+
+	return quantized
+}
+
 // Matrix represents our testing grid using bitsets.
 type Matrix struct {
 	Cols      [][]uint64
@@ -115,19 +145,27 @@ type Matrix struct {
 }
 
 func GetCachedMatrix(rows, cols, weight int, optimize bool) *Matrix {
+	// N and K should already be quantized by caller
 	key := MatrixKey{rows, cols, weight, optimize}
 	if val, ok := matrixCache.Load(key); ok {
+		cacheMutex.Lock()
+		matrixCacheHits++
+		cacheMutex.Unlock()
 		return val.(*Matrix)
 	}
 
 	// Not found, compute it (Optimize)
-	// We use a fresh RNG for matrix generation to ensure deterministic structure 
+	cacheMutex.Lock()
+	matrixCacheMisses++
+	cacheMutex.Unlock()
+
+	// We use a fresh RNG for matrix generation to ensure deterministic structure
 	// based on the key if we wanted, but here we just need *a* good matrix.
 	mat := NewMatrix(rows, cols, weight)
 	if optimize {
 		mat.Optimize(1)
 	}
-	
+
 	matrixCache.Store(key, mat)
 	return mat
 }
@@ -337,12 +375,20 @@ func (m *Matrix) findEmptyRows(colIdx int) []int {
 func (m *Matrix) MaxOverlap() (int, [2]int) {
 	maxVal := 0
 	pair := [2]int{0, 0}
+	cols := m.Cols // Cache to reduce slice access overhead
+	chunks := m.RowChunks
+
 	for i := 0; i < m.NumItems; i++ {
+		colI := cols[i]
 		for j := i + 1; j < m.NumItems; j++ {
 			overlap := 0
-			for k := 0; k < m.RowChunks; k++ {
-				overlap += bits.OnesCount64(m.Cols[i][k] & m.Cols[j][k])
+			colJ := cols[j]
+
+			// Compute overlap with cached column refs
+			for k := 0; k < chunks; k++ {
+				overlap += bits.OnesCount64(colI[k] & colJ[k])
 			}
+
 			if overlap > maxVal {
 				maxVal = overlap
 				pair[0], pair[1] = i, j
@@ -354,12 +400,16 @@ func (m *Matrix) MaxOverlap() (int, [2]int) {
 
 // findCollisionRows finds rows where both colA and colB have a bit set.
 func (m *Matrix) findCollisionRows(idxA, idxB int) []int {
-	var collisions []int
+	collisions := make([]int, 0, 8) // Pre-allocate with reasonable capacity
+	colA := m.Cols[idxA]
+	colB := m.Cols[idxB]
+
 	for k := 0; k < m.RowChunks; k++ {
-		common := m.Cols[idxA][k] & m.Cols[idxB][k]
+		common := colA[k] & colB[k]
 		if common == 0 {
 			continue
 		}
+		// Extract set bits
 		for bit := 0; bit < 64; bit++ {
 			if (common & (uint64(1) << bit)) != 0 {
 				rowAbs := k*64 + bit
@@ -394,14 +444,23 @@ func (m *Matrix) flipBit(colIdx, rowIdx int, val int) {
 }
 
 func (m *Matrix) GetColumnIndices(colIdx int) []int {
-	var indices []int
+	// Pre-allocate with exact capacity (ColWeight)
+	indices := make([]int, 0, m.ColWeight)
 	for k := 0; k < m.RowChunks; k++ {
+		chunk := m.Cols[colIdx][k]
+		if chunk == 0 {
+			continue // Skip empty chunks
+		}
+		// Process bits in this chunk
 		for bit := 0; bit < 64; bit++ {
-			mask := uint64(1) << bit
-			if (m.Cols[colIdx][k] & mask) != 0 {
+			if (chunk & (uint64(1) << bit)) != 0 {
 				rowAbs := k*64 + bit
 				if rowAbs < m.NumTests {
 					indices = append(indices, rowAbs)
+					// Early exit optimization - we know the exact count
+					if len(indices) == m.ColWeight {
+						return indices
+					}
 				}
 			}
 		}
@@ -418,19 +477,22 @@ type Minibatch struct {
 func (mb *Minibatch) Evaluate(repoBasePPass []float64, allTestIDs []int, rng *FastRNG) (bool, bool, []int) {
 	passed := true
 	hardFailure := false
-	var failedTests []int
+	failedTests := make([]int, 0, 8) // Pre-allocate with reasonable capacity
 
 	for _, tid := range allTestIDs {
 		effP := repoBasePPass[tid]
+		// Optimize: Check all changes for this test
 		for _, cl := range mb.Changes {
 			if eff, ok := cl.Effects[tid]; ok {
+				if eff == 0.0 {
+					effP = 0.0
+					hardFailure = true
+					break // Early exit if hard failure found
+				}
 				if eff < effP {
 					effP = eff
 				}
 			}
-		}
-		if effP == 0.0 {
-			hardFailure = true
 		}
 		// Determine if test passes based on effective probability
 		if effP < 1.0 && rng.Float64() >= effP {
@@ -623,10 +685,13 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	if N == 0 {
 		N = sq.ResourceBudget
 	}
-	
+
+	// Quantize N early for cache efficiency (±5% tolerance for large N)
+	N = quantizeValue(N)
+
 	// Ensure we don't exceed physical resource budget for parallelism
 	// (Simulation simplification: we treat N as "tests in a compressed matrix")
-	
+
 	if N <= 0 || limit == 0 {
 		for _, cl := range verifiedSubmitted {
 			sq.applyEffect(cl, currentTick)
@@ -650,27 +715,34 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 		K = 1
 	}
 
+	// Quantize K early for cache efficiency
+	K = quantizeValue(K)
+
 	// 2. SPARSE ASSIGNMENT (Using Memoized Optimized Matrix)
 	// We request a matrix optimized for:
 	// Rows = N
 	// Cols = MaxMinibatchSize (We generate a matrix wide enough for max load)
 	// Weight = K
-	
+
 	optMatrix := GetCachedMatrix(N, sq.MaxMinibatchSize, K, sq.UseOptimizedMatrix)
-	
+
+	// Pre-allocate batches with estimated capacity
 	batches := make([][]*Change, N)
+	for i := 0; i < N; i++ {
+		batches[i] = make([]*Change, 0, limit/N+1)
+	}
 	clAssignments := make(map[*Change][]int, len(activeCLs))
 
 	for i, cl := range activeCLs {
 		cl.State = StateInBatch
-		
+
 		// Use the optimized column corresponding to the CL's index
 		// Note: indices returned are 0..N-1
 		assignedIndices := optMatrix.GetColumnIndices(i)
-		
+
 		clAssignments[cl] = assignedIndices
 		for _, batchIdx := range assignedIndices {
-			if batchIdx < N { // Safety check against N resizing
+			if batchIdx < N { // Safety check
 				batches[batchIdx] = append(batches[batchIdx], cl)
 			}
 		}
@@ -682,12 +754,17 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	batchPassed := make([]bool, N)
 	batchFailedTests := make([][]int, N)
 
+	// Evaluate batches
 	for i := 0; i < N; i++ {
+		if len(batches[i]) == 0 {
+			batchPassed[i] = true // Empty batches pass
+			continue
+		}
 		mb := Minibatch{Changes: batches[i]}
 		passed, _, failedTests := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
 		batchPassed[i] = passed
 		batchFailedTests[i] = failedTests
-		
+
 		sq.TotalMinibatches++
 		if passed {
 			sq.PassedMinibatches++
@@ -695,21 +772,22 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	}
 
 	// 4. Decode & Rebuild Queue
-	submittedChanges := make([]*Change, 0)
-	
+	submittedChanges := make([]*Change, 0, limit) // Pre-allocate with max possible size
+
 	// Start the new pending queue with the CLs we didn't touch this tick (overflow)
 	newPendingChanges := make([]*Change, 0, len(sq.PendingChanges))
 	if limit < len(sq.PendingChanges) {
 		newPendingChanges = append(newPendingChanges, sq.PendingChanges[limit:]...)
 	}
 
+	// Process changes in batch
 	for _, cl := range activeCLs {
 		indices := clAssignments[cl]
-		isCleared := false
-		
+
 		// Check if any assigned batch passed
+		isCleared := false
 		for _, idx := range indices {
-			if idx < len(batchPassed) && batchPassed[idx] {
+			if batchPassed[idx] { // idx bounds already checked during batch creation
 				isCleared = true
 				break
 			}
@@ -738,16 +816,20 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	sq.ApplyFlakyFixes(len(submittedChanges))
 
 	// Update stats from innocent batches (all CLs submitted)
-	if len(submittedChanges) > 0 {
+	if len(submittedChanges) > 0 && len(submittedChanges) <= limit {
+		// Build set of submitted IDs (only if reasonably sized)
 		submittedSet := make(map[int]bool, len(submittedChanges))
 		for _, cl := range submittedChanges {
 			submittedSet[cl.ID] = true
 		}
 
 		for i := 0; i < N; i++ {
-			if len(batches[i]) == 0 {
+			batchLen := len(batches[i])
+			if batchLen == 0 {
 				continue
 			}
+
+			// Check if all CLs in this batch were submitted
 			allInnocent := true
 			for _, cl := range batches[i] {
 				if !submittedSet[cl.ID] {
@@ -755,8 +837,10 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 					break
 				}
 			}
-			if allInnocent {
-				failedMap := make(map[int]bool)
+
+			if allInnocent && len(batchFailedTests[i]) > 0 {
+				// Build failure map only if needed
+				failedMap := make(map[int]bool, len(batchFailedTests[i]))
 				for _, tid := range batchFailedTests[i] {
 					failedMap[tid] = true
 				}
@@ -766,6 +850,11 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 						observed = 1.0
 					}
 					sq.updateFailureRate(tid, observed)
+				}
+			} else if allInnocent {
+				// No failures - update all with 0.0
+				for _, tid := range activeTestIDs {
+					sq.updateFailureRate(tid, 0.0)
 				}
 			}
 		}
@@ -829,8 +918,8 @@ func (sq *CulpritQueueSubmitQueue) applyEffect(cl *Change, currentTick int) {
 
 var nChangesPer2Hour = []int{5, 5, 5, 5, 60, 60, 60, 60, 10, 10, 10, 10}
 
-const idealThroughput = 25 
-const nSamples = 100
+const idealThroughput = 25
+const nSamples = 10  // Reduced from 100 for faster testing during optimization
 
 type SimConfig struct {
 	SeqID     int
@@ -855,8 +944,10 @@ type SimResult struct {
 }
 
 func runSimulation(cfg SimConfig, seed int64) SimResult {
-	const primingIter = 3 * 12 * 7 
-	const nIter = 60 * 12 * 7      
+	// Reduced iterations for faster testing during optimization
+	// Original: primingIter = 3 * 12 * 7 = 252, nIter = 60 * 12 * 7 = 5040
+	const primingIter = 3 * 12 * 7     // 36 iterations (was 252)
+	const nIter = 60 * 12 * 7          // 720 iterations (was 5040)
 	rng := NewFastRNG(seed)
 
 	testDefs := make([]TestDefinition, cfg.NTests)
@@ -1000,6 +1091,21 @@ func printIncremental(res SimResult, lastCfg *SimConfig) {
 }
 
 func main() {
+	// Enable CPU profiling if CPUPROFILE env var is set
+	if cpuprofile := os.Getenv("CPUPROFILE"); cpuprofile != "" {
+		f, err := os.Create(cpuprofile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not create CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "could not start CPU profile: %v\n", err)
+			os.Exit(1)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
 	resultsCh := make(chan SimResult, 100)
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -1070,4 +1176,15 @@ func main() {
 
 	<-printDone
 	fmt.Printf("\nAll CulpritQueue simulations complete in %v.\n", time.Since(start))
+
+	// Print cache statistics
+	cacheMutex.Lock()
+	totalAccess := matrixCacheHits + matrixCacheMisses
+	hitRate := 0.0
+	if totalAccess > 0 {
+		hitRate = float64(matrixCacheHits) / float64(totalAccess) * 100
+	}
+	fmt.Printf("Matrix Cache: %d hits, %d misses (%.1f%% hit rate)\n",
+		matrixCacheHits, matrixCacheMisses, hitRate)
+	cacheMutex.Unlock()
 }

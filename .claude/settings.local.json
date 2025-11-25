@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go test:*)",
+      "Bash(go mod init:*)",
+      "Bash(time go run:*)",
+      "Bash(CPUPROFILE=cpu2.prof time go run:*)",
+      "Bash(CPUPROFILE=cpu2.prof go run:*)",
+      "Bash(go tool pprof:*)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do echo \"=== Run $i ===\")",
+      "Bash(go run:*)",
+      "Bash(done)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
