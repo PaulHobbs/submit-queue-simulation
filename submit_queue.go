@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"os"
 	"runtime/pprof"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -536,6 +538,18 @@ type CulpritQueueSubmitQueue struct {
 	TotalWaitTicks     int
 	TotalVerifications int
 	TotalVictims       int
+
+	// Enhanced statistics
+	TotalCulpritsCreated int
+	TotalCulpritsCaught  int
+	TotalInnocentFlagged int
+	WaitTimes            []int
+	QueueDepths          []int
+	MaxQueueDepth        int
+	TotalBatchSlots      int
+	UsedBatchSlots       int
+	MaxVerificationQueue int
+	TestDemotionEvents   int
 }
 
 func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, useOptimizedMatrix bool, maxK, kDivisor int, flakeTolerance float64) *CulpritQueueSubmitQueue {
@@ -573,12 +587,28 @@ func (sq *CulpritQueueSubmitQueue) ResetStats() {
 	sq.TotalWaitTicks = 0
 	sq.TotalVerifications = 0
 	sq.TotalVictims = 0
+	sq.TotalCulpritsCreated = 0
+	sq.TotalCulpritsCaught = 0
+	sq.TotalInnocentFlagged = 0
+	sq.WaitTimes = make([]int, 0, 10000)
+	sq.QueueDepths = make([]int, 0, 10000)
+	sq.MaxQueueDepth = 0
+	sq.TotalBatchSlots = 0
+	sq.UsedBatchSlots = 0
+	sq.MaxVerificationQueue = 0
+	sq.TestDemotionEvents = 0
 }
 
 func (sq *CulpritQueueSubmitQueue) AddChanges(n, currentTick int) {
 	for i := 0; i < n; i++ {
-		sq.PendingChanges = append(sq.PendingChanges, NewChange(sq.ChangeIDCounter, currentTick, sq.TestDefs, sq.rng))
+		cl := NewChange(sq.ChangeIDCounter, currentTick, sq.TestDefs, sq.rng)
+		sq.PendingChanges = append(sq.PendingChanges, cl)
 		sq.ChangeIDCounter++
+
+		// Track culprits created
+		if cl.IsCulprit() {
+			sq.TotalCulpritsCreated++
+		}
 	}
 }
 
@@ -638,11 +668,13 @@ func (sq *CulpritQueueSubmitQueue) processVerificationQueue(currentTick int) ([]
 				if passed {
 					cl.State = StateSubmitted
 					sq.TotalVictims++
+					sq.TotalInnocentFlagged++
 					submitted = append(submitted, cl)
 				} else {
 					cl.State = StateFixing
 					cl.FixDoneTick = currentTick + 60 // FixDelay
 					sq.FixingQueue = append(sq.FixingQueue, cl)
+					sq.TotalCulpritsCaught++
 				}
 				// Do not add to nextQueue
 			} else {
@@ -673,6 +705,19 @@ func (sq *CulpritQueueSubmitQueue) processFixingQueue(currentTick int) {
 func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	sq.processFixingQueue(currentTick)
 	verifiedSubmitted, _ := sq.processVerificationQueue(currentTick)
+
+	// Track queue depths
+	queueDepth := len(sq.PendingChanges)
+	sq.QueueDepths = append(sq.QueueDepths, queueDepth)
+	if queueDepth > sq.MaxQueueDepth {
+		sq.MaxQueueDepth = queueDepth
+	}
+
+	// Track verification queue
+	verifyQueueDepth := len(sq.VerificationQueue)
+	if verifyQueueDepth > sq.MaxVerificationQueue {
+		sq.MaxVerificationQueue = verifyQueueDepth
+	}
 
 	// 1. Select Candidate CLs
 	limit := sq.MaxMinibatchSize
@@ -754,12 +799,17 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 	batchPassed := make([]bool, N)
 	batchFailedTests := make([][]int, N)
 
+	// Track batch utilization
+	sq.TotalBatchSlots += N
+	usedBatches := 0
+
 	// Evaluate batches
 	for i := 0; i < N; i++ {
 		if len(batches[i]) == 0 {
 			batchPassed[i] = true // Empty batches pass
 			continue
 		}
+		usedBatches++
 		mb := Minibatch{Changes: batches[i]}
 		passed, _, failedTests := mb.Evaluate(sq.RepoBasePPass, activeTestIDs, sq.rng)
 		batchPassed[i] = passed
@@ -770,6 +820,7 @@ func (sq *CulpritQueueSubmitQueue) Step(currentTick int) int {
 			sq.PassedMinibatches++
 		}
 	}
+	sq.UsedBatchSlots += usedBatches
 
 	// 4. Decode & Rebuild Queue
 	submittedChanges := make([]*Change, 0, limit) // Pre-allocate with max possible size
@@ -877,9 +928,10 @@ func (sq *CulpritQueueSubmitQueue) ApplyFlakyFixes(n int) {
 }
 
 func (sq *CulpritQueueSubmitQueue) runPostsubmit() {
-	
+
 	newActive := make([]int, 0, len(sq.AllTestIDs))
-	
+	oldActiveCount := len(sq.activeTestIDs)
+
 	for _, tid := range sq.AllTestIDs {
 		p := sq.RepoBasePPass[tid]
 
@@ -894,11 +946,17 @@ func (sq *CulpritQueueSubmitQueue) runPostsubmit() {
 		}
 
 		sq.updateFailureRate(tid, observed)
-		
+
 		if sq.PostsubmitFailureRate[tid] <= sq.FlakeTolerance {
 			newActive = append(newActive, tid)
 		}
 	}
+
+	// Track test demotions
+	if len(newActive) < oldActiveCount {
+		sq.TestDemotionEvents += oldActiveCount - len(newActive)
+	}
+
 	sq.activeTestIDs = newActive
 }
 
@@ -911,7 +969,168 @@ func (sq *CulpritQueueSubmitQueue) applyEffect(cl *Change, currentTick int) {
 			sq.RepoBasePPass[tid] = effect
 		}
 	}
-	sq.TotalWaitTicks += (currentTick - cl.CreationTick)
+	waitTime := currentTick - cl.CreationTick
+	sq.TotalWaitTicks += waitTime
+	sq.WaitTimes = append(sq.WaitTimes, waitTime)
+}
+
+// --- ASCII Visualization Helpers ---
+
+// percentile calculates the nth percentile of a sorted slice
+func percentile(sorted []int, p float64) int {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	idx := p * float64(len(sorted)-1)
+	lower := int(idx)
+	upper := lower + 1
+	if upper >= len(sorted) {
+		return sorted[lower]
+	}
+	fraction := idx - float64(lower)
+	return int(float64(sorted[lower])*(1-fraction) + float64(sorted[upper])*fraction)
+}
+
+// sparkline creates a mini ASCII graph using block characters
+func sparkline(values []int, width int) string {
+	if len(values) == 0 {
+		return ""
+	}
+
+	// Sample the values if we have more than width
+	sampled := make([]int, width)
+	if len(values) <= width {
+		copy(sampled, values)
+		sampled = sampled[:len(values)]
+	} else {
+		step := float64(len(values)) / float64(width)
+		for i := 0; i < width; i++ {
+			idx := int(float64(i) * step)
+			sampled[i] = values[idx]
+		}
+	}
+
+	// Find min/max for scaling
+	minVal, maxVal := sampled[0], sampled[0]
+	for _, v := range sampled {
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+
+	if minVal == maxVal {
+		return strings.Repeat("▄", len(sampled))
+	}
+
+	// Map to spark characters
+	chars := []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+	var result strings.Builder
+	for _, v := range sampled {
+		normalized := float64(v-minVal) / float64(maxVal-minVal)
+		idx := int(normalized * float64(len(chars)-1))
+		result.WriteRune(chars[idx])
+	}
+	return result.String()
+}
+
+// histogram creates an ASCII histogram with given number of buckets
+func histogram(values []int, buckets int, width int) string {
+	if len(values) == 0 || buckets == 0 {
+		return ""
+	}
+
+	// Find min/max
+	minVal, maxVal := values[0], values[0]
+	for _, v := range values {
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+
+	if minVal == maxVal {
+		return fmt.Sprintf("  All values: %d\n", minVal)
+	}
+
+	// Create buckets
+	counts := make([]int, buckets)
+	bucketSize := float64(maxVal-minVal) / float64(buckets)
+
+	for _, v := range values {
+		bucketIdx := int(float64(v-minVal) / bucketSize)
+		if bucketIdx >= buckets {
+			bucketIdx = buckets - 1
+		}
+		counts[bucketIdx]++
+	}
+
+	// Find max count for scaling
+	maxCount := 0
+	for _, c := range counts {
+		if c > maxCount {
+			maxCount = c
+		}
+	}
+
+	// Build histogram
+	var result strings.Builder
+	blockChars := []rune{'░', '▒', '▓', '█'}
+
+	for i := 0; i < buckets; i++ {
+		rangeStart := minVal + int(float64(i)*bucketSize)
+		rangeEnd := minVal + int(float64(i+1)*bucketSize)
+
+		// Calculate bar length
+		barLength := 0
+		if maxCount > 0 {
+			barLength = int(float64(counts[i]) / float64(maxCount) * float64(width))
+		}
+
+		// Create bar with gradient
+		var bar strings.Builder
+		for j := 0; j < barLength; j++ {
+			progress := float64(j) / float64(width)
+			charIdx := int(progress * float64(len(blockChars)-1))
+			if charIdx >= len(blockChars) {
+				charIdx = len(blockChars) - 1
+			}
+			bar.WriteRune(blockChars[charIdx])
+		}
+
+		result.WriteString(fmt.Sprintf("  %5d-%5d │%-*s│ %d\n",
+			rangeStart, rangeEnd, width, bar.String(), counts[i]))
+	}
+
+	return result.String()
+}
+
+// barChart creates a simple horizontal bar chart
+func barChart(label string, value, max float64, width int) string {
+	if max == 0 {
+		max = 1
+	}
+	filled := int(value / max * float64(width))
+	if filled > width {
+		filled = width
+	}
+	if filled < 0 {
+		filled = 0
+	}
+
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+	percentage := value / max * 100
+	return fmt.Sprintf("  %-20s │%s│ %6.1f%%", label, bar, percentage)
 }
 
 // --- Simulation & Reporting ---
@@ -934,13 +1153,32 @@ type SimConfig struct {
 }
 
 type SimResult struct {
-	Config        SimConfig
-	Slowdown      float64
-	AvgQueueSize  float64
-	MBPassRate    float64
-	VictimRate    float64
-	AvgSubmitTime float64
+	Config              SimConfig
+	Slowdown            float64
+	AvgQueueSize        float64
+	MBPassRate          float64
+	VictimRate          float64
+	AvgSubmitTime       float64
 	AvgRunsPerSubmitted float64
+
+	// Enhanced statistics
+	CulpritsCreated     int
+	CulpritsCaught      int
+	InnocentFlagged     int
+	FalseNegativeRate   float64
+	TruePositiveRate    float64
+	WaitTimeP50         int
+	WaitTimeP95         int
+	WaitTimeP99         int
+	WaitTimeMin         int
+	WaitTimeMax         int
+	QueueDepthSparkline string
+	MaxQueueDepth       int
+	BatchUtilization    float64
+	MaxVerifyQueue      int
+	ActiveTests         int
+	DemotedTests        int
+	WaitTimeHistogram   string
 }
 
 func runSimulation(cfg SimConfig, seed int64) SimResult {
@@ -1034,19 +1272,82 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		avgRuns = (float64(sq.TotalMinibatches) + float64(sq.TotalVerifications) / 16) / float64(sq.TotalSubmitted)
 	}
 
+	// Calculate culprit detection stats
+	falseNegativeRate := 0.0
+	if sq.TotalCulpritsCreated > 0 {
+		culpritsEscaped := sq.TotalCulpritsCreated - sq.TotalCulpritsCaught
+		falseNegativeRate = float64(culpritsEscaped) / float64(sq.TotalCulpritsCreated)
+	}
+
+	truePositiveRate := 0.0
+	totalFlagged := sq.TotalCulpritsCaught + sq.TotalInnocentFlagged
+	if totalFlagged > 0 {
+		truePositiveRate = float64(sq.TotalCulpritsCaught) / float64(totalFlagged)
+	}
+
+	// Calculate wait time percentiles
+	sortedWaitTimes := make([]int, len(sq.WaitTimes))
+	copy(sortedWaitTimes, sq.WaitTimes)
+	sort.Ints(sortedWaitTimes)
+
+	waitP50 := percentile(sortedWaitTimes, 0.50)
+	waitP95 := percentile(sortedWaitTimes, 0.95)
+	waitP99 := percentile(sortedWaitTimes, 0.99)
+	waitMin := 0
+	waitMax := 0
+	if len(sortedWaitTimes) > 0 {
+		waitMin = sortedWaitTimes[0]
+		waitMax = sortedWaitTimes[len(sortedWaitTimes)-1]
+	}
+
+	// Create sparkline for queue depth
+	queueSparkline := sparkline(sq.QueueDepths, 50)
+
+	// Calculate batch utilization
+	batchUtil := 0.0
+	if sq.TotalBatchSlots > 0 {
+		batchUtil = float64(sq.UsedBatchSlots) / float64(sq.TotalBatchSlots)
+	}
+
+	// Create wait time histogram
+	waitHistogram := histogram(sortedWaitTimes, 8, 30)
+
 	return SimResult{
-		Config:        cfg,
-		Slowdown:      slowdown,
-		AvgQueueSize:  float64(totalQ) / float64(nIter),
-		MBPassRate:    mbPassRate,
-		VictimRate:    victimRate,
-		AvgSubmitTime: avgSubmitTime,
+		Config:              cfg,
+		Slowdown:            slowdown,
+		AvgQueueSize:        float64(totalQ) / float64(nIter),
+		MBPassRate:          mbPassRate,
+		VictimRate:          victimRate,
+		AvgSubmitTime:       avgSubmitTime,
 		AvgRunsPerSubmitted: avgRuns,
+		CulpritsCreated:     sq.TotalCulpritsCreated,
+		CulpritsCaught:      sq.TotalCulpritsCaught,
+		InnocentFlagged:     sq.TotalInnocentFlagged,
+		FalseNegativeRate:   falseNegativeRate,
+		TruePositiveRate:    truePositiveRate,
+		WaitTimeP50:         waitP50,
+		WaitTimeP95:         waitP95,
+		WaitTimeP99:         waitP99,
+		WaitTimeMin:         waitMin,
+		WaitTimeMax:         waitMax,
+		QueueDepthSparkline: queueSparkline,
+		MaxQueueDepth:       sq.MaxQueueDepth,
+		BatchUtilization:    batchUtil,
+		MaxVerifyQueue:      sq.MaxVerificationQueue,
+		ActiveTests:         len(sq.activeTestIDs),
+		DemotedTests:        sq.TestDemotionEvents,
+		WaitTimeHistogram:   waitHistogram,
 	}
 }
 
 func runAveragedSimulation(cfg SimConfig) SimResult {
 	var sumSlowdown, sumQSize, sumMBPassRate, sumSubmitTime, sumVictimRate, sumBuilds float64
+	var sumCulpritsCreated, sumCulpritsCaught, sumInnocentFlagged int
+	var sumFalseNegRate, sumTruePositiveRate float64
+	var sumWaitP50, sumWaitP95, sumWaitP99, sumWaitMin, sumWaitMax int
+	var sumMaxQueue, sumMaxVerify, sumActiveTests, sumDemotedTests int
+	var sumBatchUtil float64
+	var lastSparkline, lastHistogram string
 
 	for i := 0; i < nSamples; i++ {
 		seed := int64((cfg.SeqID*nSamples + i) * 997)
@@ -1058,36 +1359,135 @@ func runAveragedSimulation(cfg SimConfig) SimResult {
 		sumSubmitTime += res.AvgSubmitTime
 		sumVictimRate += res.VictimRate
 		sumBuilds += res.AvgRunsPerSubmitted
+
+		sumCulpritsCreated += res.CulpritsCreated
+		sumCulpritsCaught += res.CulpritsCaught
+		sumInnocentFlagged += res.InnocentFlagged
+		sumFalseNegRate += res.FalseNegativeRate
+		sumTruePositiveRate += res.TruePositiveRate
+		sumWaitP50 += res.WaitTimeP50
+		sumWaitP95 += res.WaitTimeP95
+		sumWaitP99 += res.WaitTimeP99
+		sumWaitMin += res.WaitTimeMin
+		sumWaitMax += res.WaitTimeMax
+		sumMaxQueue += res.MaxQueueDepth
+		sumMaxVerify += res.MaxVerifyQueue
+		sumActiveTests += res.ActiveTests
+		sumDemotedTests += res.DemotedTests
+		sumBatchUtil += res.BatchUtilization
+
+		lastSparkline = res.QueueDepthSparkline
+		lastHistogram = res.WaitTimeHistogram
 	}
 
 	return SimResult{
-		Config:        cfg,
-		Slowdown:      sumSlowdown / float64(nSamples),
-		AvgQueueSize:  sumQSize / float64(nSamples),
-		MBPassRate:    sumMBPassRate / float64(nSamples),
-		VictimRate:    sumVictimRate / float64(nSamples),
-		AvgSubmitTime: sumSubmitTime / float64(nSamples),
+		Config:              cfg,
+		Slowdown:            sumSlowdown / float64(nSamples),
+		AvgQueueSize:        sumQSize / float64(nSamples),
+		MBPassRate:          sumMBPassRate / float64(nSamples),
+		VictimRate:          sumVictimRate / float64(nSamples),
+		AvgSubmitTime:       sumSubmitTime / float64(nSamples),
 		AvgRunsPerSubmitted: sumBuilds / float64(nSamples),
+		CulpritsCreated:     sumCulpritsCreated / nSamples,
+		CulpritsCaught:      sumCulpritsCaught / nSamples,
+		InnocentFlagged:     sumInnocentFlagged / nSamples,
+		FalseNegativeRate:   sumFalseNegRate / float64(nSamples),
+		TruePositiveRate:    sumTruePositiveRate / float64(nSamples),
+		WaitTimeP50:         sumWaitP50 / nSamples,
+		WaitTimeP95:         sumWaitP95 / nSamples,
+		WaitTimeP99:         sumWaitP99 / nSamples,
+		WaitTimeMin:         sumWaitMin / nSamples,
+		WaitTimeMax:         sumWaitMax / nSamples,
+		QueueDepthSparkline: lastSparkline,
+		MaxQueueDepth:       sumMaxQueue / nSamples,
+		BatchUtilization:    sumBatchUtil / float64(nSamples),
+		MaxVerifyQueue:      sumMaxVerify / nSamples,
+		ActiveTests:         sumActiveTests / nSamples,
+		DemotedTests:        sumDemotedTests / nSamples,
+		WaitTimeHistogram:   lastHistogram,
 	}
+}
+
+func printDetailedStats(res SimResult) {
+	fmt.Printf("\n╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║  DETAILED STATISTICS - FlakeTolerance: %.2f                                                                                      ║\n", res.Config.FlakeTolerance)
+	fmt.Printf("╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣\n")
+
+	// Culprit Detection
+	fmt.Printf("║                                                                                                                                ║\n")
+	fmt.Printf("║  🎯 CULPRIT DETECTION                                                                                                          ║\n")
+	fmt.Printf("║    Culprits Created:    %8d                                                                                                ║\n", res.CulpritsCreated)
+	fmt.Printf("║    Culprits Caught:     %8d                                                                                                ║\n", res.CulpritsCaught)
+	fmt.Printf("║    Innocent Flagged:    %8d                                                                                                ║\n", res.InnocentFlagged)
+	fmt.Printf("║    False Negative Rate: %7.1f%%                                                                                                ║\n", res.FalseNegativeRate*100)
+	fmt.Printf("║    True Positive Rate:  %7.1f%%                                                                                                ║\n", res.TruePositiveRate*100)
+	fmt.Printf("║                                                                                                                                ║\n")
+
+	// Latency Distribution
+	fmt.Printf("║  ⏱️  LATENCY DISTRIBUTION (ticks)                                                                                               ║\n")
+	fmt.Printf("║    Min:  %6d  │  P50:  %6d  │  P95:  %6d  │  P99:  %6d  │  Max:  %6d                                        ║\n",
+		res.WaitTimeMin, res.WaitTimeP50, res.WaitTimeP95, res.WaitTimeP99, res.WaitTimeMax)
+	fmt.Printf("║                                                                                                                                ║\n")
+
+	// Queue Health
+	fmt.Printf("║  📊 QUEUE HEALTH                                                                                                               ║\n")
+	fmt.Printf("║    Average Queue Depth: %8.0f                                                                                                 ║\n", res.AvgQueueSize)
+	fmt.Printf("║    Max Queue Depth:     %8d                                                                                                 ║\n", res.MaxQueueDepth)
+	fmt.Printf("║    Max Verify Queue:    %8d                                                                                                 ║\n", res.MaxVerifyQueue)
+	fmt.Printf("║    Queue Depth Over Time (50 samples):                                                                                         ║\n")
+	fmt.Printf("║    %s                                                                                 ║\n", res.QueueDepthSparkline)
+	fmt.Printf("║                                                                                                                                ║\n")
+
+	// Resource Utilization
+	fmt.Printf("║  ⚙️  RESOURCE UTILIZATION                                                                                                       ║\n")
+	fmt.Printf("║    Batch Utilization:   %7.1f%%                                                                                                ║\n", res.BatchUtilization*100)
+	fmt.Printf("║%s║\n", barChart("Batch Usage", res.BatchUtilization, 1.0, 40))
+	fmt.Printf("║                                                                                                                                ║\n")
+
+	// Test Health
+	fmt.Printf("║  🧪 TEST HEALTH                                                                                                                ║\n")
+	fmt.Printf("║    Active Tests:        %8d / %d                                                                                            ║\n", res.ActiveTests, res.Config.NTests)
+	fmt.Printf("║    Demoted Tests:       %8d                                                                                                 ║\n", res.DemotedTests)
+	activePercentage := float64(res.ActiveTests) / float64(res.Config.NTests)
+	fmt.Printf("║%s║\n", barChart("Active Tests", activePercentage, 1.0, 40))
+	fmt.Printf("║                                                                                                                                ║\n")
+
+	// Wait Time Histogram
+	fmt.Printf("║  📈 WAIT TIME DISTRIBUTION                                                                                                     ║\n")
+	histLines := strings.Split(strings.TrimRight(res.WaitTimeHistogram, "\n"), "\n")
+	for _, line := range histLines {
+		if line != "" {
+			fmt.Printf("║%-127s║\n", line)
+		}
+	}
+
+	fmt.Printf("╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n")
 }
 
 func printIncremental(res SimResult, lastCfg *SimConfig) {
 	cfg := res.Config
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources {
-		fmt.Printf("CulpritQueue Resources (N Batches): %d\n", cfg.Resources)
+		fmt.Printf("\n╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n")
+		fmt.Printf("║  CulpritQueue Resources (N Batches): %-3d                                                                                      ║\n", cfg.Resources)
+		fmt.Printf("╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n")
 	}
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic {
-		fmt.Printf("\nIdeal throughput: %d CLs/2hour\n", idealThroughput*cfg.Traffic)
-		fmt.Printf("%-10s | %-5s | %-5s | %-5s | %-10s | %-12s | %-14s | %-9s | %-9s | %-10s | %s\n",
+		fmt.Printf("\n  Ideal Throughput: %d CLs/2hour\n\n", idealThroughput*cfg.Traffic)
+		fmt.Printf("┌────────────┬───────┬───────┬───────┬────────────┬──────────────┬────────────────┬───────────┬───────────┬────────────┬────────────────┐\n")
+		fmt.Printf("│ %-10s │ %-5s │ %-5s │ %-5s │ %-10s │ %-12s │ %-14s │ %-9s │ %-9s │ %-10s │ %-14s │\n",
 			"Optimized", "MaxK", "Div", "Flake", "Max Batch", "Slowdown", "Avg Queue", "Pass Rate", "Victim%", "Runs/CL", "Avg Time (h)")
-		fmt.Println("-----------------------------------------------------------------------------------------------------------------------------------")
+		fmt.Printf("├────────────┼───────┼───────┼───────┼────────────┼──────────────┼────────────────┼───────────┼───────────┼────────────┼────────────────┤\n")
 	}
 	if lastCfg == nil || cfg.Resources != lastCfg.Resources || cfg.Traffic != lastCfg.Traffic || cfg.NTests != lastCfg.NTests {
-		fmt.Printf("n_tests: %d\n", cfg.NTests)
+		fmt.Printf("│ Tests: %-3d                                                                                                                     │\n", cfg.NTests)
+		fmt.Printf("├────────────┼───────┼───────┼───────┼────────────┼──────────────┼────────────────┼───────────┼───────────┼────────────┼────────────────┤\n")
 	}
 
-	fmt.Printf("%-10v | %-5d | %-5d | %-5.2f | %-10d | %-12.2f | %-14.0f | %-9.2f | %-9.1f | %-10.2f | %.2f\n",
-		cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance, cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, 100 * res.VictimRate, res.AvgRunsPerSubmitted, res.AvgSubmitTime)
+	fmt.Printf("│ %-10v │ %5d │ %5d │ %5.2f │ %10d │ %12.2f │ %14.0f │ %9.2f │ %8.1f%% │ %10.2f │ %14.2f │\n",
+		cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance, cfg.MaxBatch, res.Slowdown, res.AvgQueueSize, res.MBPassRate, 100*res.VictimRate, res.AvgRunsPerSubmitted, res.AvgSubmitTime)
+
+	// Print detailed stats for this configuration
+	printDetailedStats(res)
 }
 
 func main() {
@@ -1175,7 +1575,13 @@ func main() {
 	}()
 
 	<-printDone
-	fmt.Printf("\nAll CulpritQueue simulations complete in %v.\n", time.Since(start))
+	fmt.Printf("└────────────┴───────┴───────┴───────┴────────────┴──────────────┴────────────────┴───────────┴───────────┴────────────┴────────────────┘\n")
+
+	elapsed := time.Since(start)
+	fmt.Printf("\n╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║  SIMULATION COMPLETE                                                                                                           ║\n")
+	fmt.Printf("╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣\n")
+	fmt.Printf("║  Elapsed Time: %-108v║\n", elapsed)
 
 	// Print cache statistics
 	cacheMutex.Lock()
@@ -1184,7 +1590,11 @@ func main() {
 	if totalAccess > 0 {
 		hitRate = float64(matrixCacheHits) / float64(totalAccess) * 100
 	}
-	fmt.Printf("Matrix Cache: %d hits, %d misses (%.1f%% hit rate)\n",
-		matrixCacheHits, matrixCacheMisses, hitRate)
+	fmt.Printf("║                                                                                                                                ║\n")
+	fmt.Printf("║  Matrix Cache Statistics:                                                                                                      ║\n")
+	fmt.Printf("║    • Cache Hits:    %8d                                                                                                    ║\n", matrixCacheHits)
+	fmt.Printf("║    • Cache Misses:  %8d                                                                                                    ║\n", matrixCacheMisses)
+	fmt.Printf("║    • Hit Rate:      %7.1f%%                                                                                                    ║\n", hitRate)
 	cacheMutex.Unlock()
+	fmt.Printf("╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n")
 }
