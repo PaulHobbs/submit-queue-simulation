@@ -1142,7 +1142,7 @@ func barChart(label string, value, max float64, width int) string {
 var nChangesPer2Hour = []int{5, 5, 5, 5, 60, 60, 60, 60, 10, 10, 10, 10}
 
 const idealThroughput = 25
-const nSamples = 10  // Reduced from 100 for faster testing during optimization
+const nSamples = 32  // Reduced from 100 for faster testing during optimization
 
 type SimConfig struct {
 	SeqID     int
@@ -1551,10 +1551,28 @@ func runAveragedSimulation(cfg SimConfig) SimResult {
 	var sumBatchUtil float64
 	var lastSparkline, lastHistogram string
 
-	for i := 0; i < nSamples; i++ {
-		seed := int64((cfg.SeqID*nSamples + i) * 997)
-		res := runSimulation(cfg, seed)
+	// Use goroutines to gather samples in parallel
+	resultsChan := make(chan SimResult, nSamples)
+	var wg sync.WaitGroup
 
+	for i := 0; i < nSamples; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			seed := int64((cfg.SeqID*nSamples + idx) * 997)
+			res := runSimulation(cfg, seed)
+			resultsChan <- res
+		}(i)
+	}
+
+	// Close channel once all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Collect and aggregate results
+	for res := range resultsChan {
 		sumSlowdown += res.Slowdown
 		sumQSize += res.AvgQueueSize
 		sumMBPassRate += res.MBPassRate
