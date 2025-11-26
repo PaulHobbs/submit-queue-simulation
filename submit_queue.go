@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1734,9 +1736,402 @@ type JSONResult struct {
 	DemotedTests        int       `json:"demoted_tests"`
 }
 
+// --- CSV Data Reading ---
+
+type CSVRecord struct {
+	ChangeNumber       int
+	Target             string
+	CreationTimeMillis int64
+	Success            bool
+	Flake              bool
+	Timestamp          int64
+	Hour               int
+	IsBad              bool
+}
+
+// CSVChange represents a change with accumulated data from CSV
+type CSVChange struct {
+	ChangeNumber       int
+	CreationTimeMillis int64
+	IsBad              bool
+	TargetResults      map[string]CSVTargetResult // target -> result
+}
+
+type CSVTargetResult struct {
+	HasFailure bool
+	HasFlake   bool
+}
+
+func parseCSVFile(filename string) ([]CSVRecord, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	var csvRecords []CSVRecord
+	// Skip header row if present
+	start := 0
+	if len(records) > 0 && records[0][0] == "change_number" {
+		start = 1
+	}
+
+	for i := start; i < len(records); i++ {
+		row := records[i]
+		if len(row) < 8 {
+			continue
+		}
+
+		changeNum, _ := strconv.Atoi(row[0])
+		target := row[1]
+		creationTime, _ := strconv.ParseInt(row[2], 10, 64)
+		success, _ := strconv.ParseBool(row[3])
+		flake, _ := strconv.ParseBool(row[4])
+		timestamp, _ := strconv.ParseInt(row[5], 10, 64)
+		hour, _ := strconv.Atoi(row[6])
+		isBad, _ := strconv.ParseBool(row[7])
+
+		csvRecords = append(csvRecords, CSVRecord{
+			ChangeNumber:       changeNum,
+			Target:             target,
+			CreationTimeMillis: creationTime,
+			Success:            success,
+			Flake:              flake,
+			Timestamp:          timestamp,
+			Hour:               hour,
+			IsBad:              isBad,
+		})
+	}
+
+	return csvRecords, nil
+}
+
+// convertCSVToChanges groups CSV records by change_number and creates Change objects
+// Also returns the test definitions derived from the CSV data
+func convertCSVToChanges(csvRecords []CSVRecord, rng *FastRNG) ([]CSVChange, map[string]int, map[int]bool) {
+	// Group records by change_number
+	changeMap := make(map[int]CSVChange)
+	targetToID := make(map[string]int)
+	allTests := make(map[int]bool)
+	testIDCounter := 0
+
+	for _, record := range csvRecords {
+		if _, exists := changeMap[record.ChangeNumber]; !exists {
+			changeMap[record.ChangeNumber] = CSVChange{
+				ChangeNumber:       record.ChangeNumber,
+				CreationTimeMillis: record.CreationTimeMillis,
+				IsBad:              record.IsBad,
+				TargetResults:      make(map[string]CSVTargetResult),
+			}
+		}
+
+		change := changeMap[record.ChangeNumber]
+		result := change.TargetResults[record.Target]
+
+		// Track failures and flakes
+		if !record.Success {
+			result.HasFailure = true
+		}
+		if record.Success && record.Flake {
+			result.HasFlake = true
+		}
+
+		change.TargetResults[record.Target] = result
+		changeMap[record.ChangeNumber] = change
+
+		// Collect all unique targets and assign sequential IDs
+		if _, exists := targetToID[record.Target]; !exists {
+			targetToID[record.Target] = testIDCounter
+			allTests[testIDCounter] = true
+			testIDCounter++
+		}
+	}
+
+	changes := make([]CSVChange, 0, len(changeMap))
+	for _, change := range changeMap {
+		changes = append(changes, change)
+	}
+
+	return changes, targetToID, allTests
+}
+
+// createTestDefinitionsFromCSV creates test definitions from CSV data
+func createTestDefinitionsFromCSV(allTests map[int]bool) []TestDefinition {
+	testDefs := make([]TestDefinition, len(allTests))
+	i := 0
+	for testID := range allTests {
+		testDefs[i] = TestDefinition{
+			ID:        testID,
+			PAffected: 0.005, // Kept for compatibility, not used in CSV mode
+			PassRates: []DistEntry{
+				{0.5, 1.0},
+				{0.55, 0.995},
+				{0.59, 0.98},
+				{0.60, 0.95},
+				{0.64, 0.80},
+				{0.68, 0.20},
+				{1.0, 0.0},
+			},
+		}
+		i++
+	}
+	return testDefs
+}
+
+// createChangeFromCSVChange converts a CSVChange to a Change with computed Effects
+func createChangeFromCSVChange(csvChange CSVChange, creationTick int, targetToID map[string]int, allTests map[int]bool) *Change {
+	change := &Change{
+		ID:           csvChange.ChangeNumber,
+		CreationTick: creationTick,
+		Effects:      make(map[int]float64, len(allTests)),
+	}
+
+	// Initialize all tests to 1.0 (no effect)
+	for testID := range allTests {
+		change.Effects[testID] = 1.0
+	}
+
+	// Apply effects based on target results
+	for target, result := range csvChange.TargetResults {
+		testID, exists := targetToID[target]
+		if !exists {
+			continue
+		}
+
+		if result.HasFailure {
+			// Hard failure: set effect to 0.0
+			change.Effects[testID] = 0.0
+		} else if result.HasFlake {
+			// Flaky: set effect to a reduced pass rate
+			change.Effects[testID] = 0.5 // Could be parameterized
+		}
+	}
+
+	// Set state based on is_bad
+	if csvChange.IsBad {
+		change.State = StateSuspect
+	} else {
+		change.State = StateQueued
+	}
+
+	return change
+}
+
+// groupChangesByHour groups changes by creation hour and returns them in time order
+func groupChangesByHour(csvChanges []CSVChange) map[int][]CSVChange {
+	hourMap := make(map[int][]CSVChange)
+
+	for _, change := range csvChanges {
+		// Convert milliseconds to hours since epoch
+		millisPerHour := int64(3600000)
+		hour := int(change.CreationTimeMillis / millisPerHour)
+		hourMap[hour] = append(hourMap[hour], change)
+	}
+
+	return hourMap
+}
+
+// runCSVMode runs simulation with data from CSV file
+func runCSVMode(csvFilePath string, implicitParams ImplicitParams, resources, maxBatch, maxK, kDiv int, flakeTol float64, useOptimized bool) {
+	// Parse CSV file
+	csvRecords, err := parseCSVFile(csvFilePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading CSV file: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(csvRecords) == 0 {
+		fmt.Fprintf(os.Stderr, "No records found in CSV file\n")
+		os.Exit(1)
+	}
+
+	// Convert CSV to internal format
+	rng := NewFastRNG(time.Now().UnixNano())
+	csvChanges, targetToID, allTests := convertCSVToChanges(csvRecords, rng)
+
+	// Create test definitions from CSV
+	testDefs := createTestDefinitionsFromCSV(allTests)
+
+	// Group changes by hour
+	hourMap := groupChangesByHour(csvChanges)
+
+	// Find min and max hours to determine simulation range
+	minHour := int(^uint(0) >> 1) // max int
+	maxHour := 0
+	for hour := range hourMap {
+		if hour < minHour {
+			minHour = hour
+		}
+		if hour > maxHour {
+			maxHour = hour
+		}
+	}
+
+	fmt.Printf("CSV Mode: Loaded %d changes across %d hours, %d unique tests\n", len(csvChanges), maxHour-minHour+1, len(testDefs))
+
+	// Create simulation queue
+	cfg := SimConfig{
+		SeqID:              0,
+		Resources:          resources,
+		Traffic:            1, // Not used in CSV mode
+		NTests:             len(testDefs),
+		MaxBatch:           maxBatch,
+		UseOptimizedMatrix: useOptimized,
+		MaxK:               maxK,
+		KDivisor:           kDiv,
+		FlakeTolerance:     flakeTol,
+	}
+
+	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance, implicitParams)
+
+	// Run simulation by iterating through hours
+	const primingIter = 3 * 12 * 7     // 252 hours of priming
+	const nIter = 60 * 12 * 7          // 5040 hours of measurement
+
+	totalQ := 0
+	submittedTotal := 0
+	tickCounter := 0
+
+	for hour := minHour; hour <= maxHour && tickCounter < primingIter+nIter; hour++ {
+		if tickCounter == primingIter {
+			sq.ResetStats()
+		}
+
+		// Add all changes from this hour
+		if changes, ok := hourMap[hour]; ok {
+			for _, csvChange := range changes {
+				change := createChangeFromCSVChange(csvChange, tickCounter, targetToID, allTests)
+				sq.PendingChanges = append(sq.PendingChanges, change)
+				sq.ChangeIDCounter++
+
+				// Track culprits created
+				if csvChange.IsBad {
+					sq.TotalCulpritsCreated++
+				}
+			}
+		}
+
+		// Run one tick of simulation
+		submitted := sq.Step(tickCounter)
+
+		if tickCounter >= primingIter {
+			submittedTotal += submitted
+			totalQ += len(sq.PendingChanges)
+		}
+
+		// Track queue depths
+		queueDepth := len(sq.PendingChanges)
+		sq.QueueDepths = append(sq.QueueDepths, queueDepth)
+		if queueDepth > sq.MaxQueueDepth {
+			sq.MaxQueueDepth = queueDepth
+		}
+
+		// Track verification queue
+		verifyQueueDepth := len(sq.VerificationQueue)
+		if verifyQueueDepth > sq.MaxVerificationQueue {
+			sq.MaxVerificationQueue = verifyQueueDepth
+		}
+
+		tickCounter++
+	}
+
+	// Compute results
+	mbPassRate := 0.0
+	if sq.TotalMinibatches > 0 {
+		mbPassRate = float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
+	}
+
+	avgSubmitTime := 0.0
+	if sq.TotalSubmitted > 0 {
+		avgSubmitTime = 2.0 + 2*float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
+	}
+
+	throughput := 0.0
+	if nIter > 0 {
+		throughput = float64(submittedTotal) / float64(nIter)
+	}
+
+	slowdown := math.Inf(1)
+	if throughput > 0 {
+		slowdown = float64(idealThroughput) / throughput
+	}
+
+	victimRate := 0.0
+	if sq.TotalVerifications > 0 {
+		victimRate = float64(sq.TotalVictims) / float64(sq.TotalVerifications)
+	}
+
+	avgRuns := 0.0
+	if sq.TotalSubmitted > 0 {
+		avgRuns = (float64(sq.TotalMinibatches) + float64(sq.TotalVerifications)/16) / float64(sq.TotalSubmitted)
+	}
+
+	// Calculate culprit detection stats
+	falseNegativeRate := 0.0
+	if sq.TotalCulpritsCreated > 0 {
+		culpritsEscaped := sq.TotalCulpritsCreated - sq.TotalCulpritsCaught
+		falseNegativeRate = float64(culpritsEscaped) / float64(sq.TotalCulpritsCreated)
+	}
+
+	truePositiveRate := 0.0
+	totalFlagged := sq.TotalCulpritsCaught + sq.TotalInnocentFlagged
+	if totalFlagged > 0 {
+		truePositiveRate = float64(sq.TotalCulpritsCaught) / float64(totalFlagged)
+	}
+
+	// Print results
+	res := SimResult{
+		Config:              cfg,
+		Slowdown:            slowdown,
+		AvgQueueSize:        float64(totalQ) / float64(nIter),
+		MBPassRate:          mbPassRate,
+		VictimRate:          victimRate,
+		AvgSubmitTime:       avgSubmitTime,
+		AvgRunsPerSubmitted: avgRuns,
+		CulpritsCreated:     sq.TotalCulpritsCreated,
+		CulpritsCaught:      sq.TotalCulpritsCaught,
+		InnocentFlagged:     sq.TotalInnocentFlagged,
+		FalseNegativeRate:   falseNegativeRate,
+		TruePositiveRate:    truePositiveRate,
+	}
+
+	// Calculate wait time percentiles
+	sortedWaitTimes := make([]int, len(sq.WaitTimes))
+	copy(sortedWaitTimes, sq.WaitTimes)
+	sort.Ints(sortedWaitTimes)
+
+	res.WaitTimeP50 = percentile(sortedWaitTimes, 0.50)
+	res.WaitTimeP95 = percentile(sortedWaitTimes, 0.95)
+	res.WaitTimeP99 = percentile(sortedWaitTimes, 0.99)
+	if len(sortedWaitTimes) > 0 {
+		res.WaitTimeMin = sortedWaitTimes[0]
+		res.WaitTimeMax = sortedWaitTimes[len(sortedWaitTimes)-1]
+	}
+
+	res.QueueDepthSparkline = sparkline(sq.QueueDepths, 50)
+	if sq.TotalBatchSlots > 0 {
+		res.BatchUtilization = float64(sq.UsedBatchSlots) / float64(sq.TotalBatchSlots)
+	}
+	res.MaxQueueDepth = sq.MaxQueueDepth
+	res.MaxVerifyQueue = sq.MaxVerificationQueue
+	res.ActiveTests = len(sq.activeTestIDs)
+	res.DemotedTests = sq.TestDemotionEvents
+	res.WaitTimeHistogram = histogram(sortedWaitTimes, 8, 30)
+
+	// Print result
+	printIncremental(res, nil)
+}
+
 func main() {
 	// Command-line flags for optimizer
 	jsonOutput := flag.Bool("json", false, "Output results as JSON")
+	csvFile := flag.String("csv", "", "CSV file with build history data")
 	resources := flag.Int("resources", 74, "Number of parallel batches")
 	traffic := flag.Int("traffic", 8, "Traffic multiplier")
 	nTests := flag.Int("ntests", 32, "Number of tests")
@@ -1772,6 +2167,12 @@ func main() {
 		BackpressureThreshold1: *backpressureThreshold1,
 		BackpressureThreshold2: *backpressureThreshold2,
 		BackpressureThreshold3: *backpressureThreshold3,
+	}
+
+	// If CSV mode, read from file and run simulation
+	if *csvFile != "" {
+		runCSVMode(*csvFile, implicitParams, *resources, *maxBatch, *maxK, *kDiv, *flakeTol, *useOpt)
+		return
 	}
 
 	// If JSON mode, run single simulation with given parameters
