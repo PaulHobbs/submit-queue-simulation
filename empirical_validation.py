@@ -75,6 +75,23 @@ WEIGHTS = {
     'target_wait_time': 20.0,
 }
 
+# Integer parameters (need rounding)
+INTEGER_PARAMS = {
+    'resources', 'maxbatch', 'maxk', 'kdiv',
+    'verify_latency', 'fix_delay', 'verify_resource_mult', 'ntests'
+}
+
+
+def normalize_config(config: Dict) -> Dict:
+    """Normalize config to have correct types (int vs float)."""
+    normalized = {}
+    for key, value in config.items():
+        if key in INTEGER_PARAMS:
+            normalized[key] = int(round(value))
+        else:
+            normalized[key] = value
+    return normalized
+
 
 def compute_objective(metrics: Dict) -> float:
     """Compute developer productivity score."""
@@ -215,6 +232,7 @@ def extract_top_candidates(
         config = {name: samples[idx, i] for i, name in enumerate(param_names)}
         config['ntests'] = 32
         config['optimized'] = False
+        config = normalize_config(config)  # Round integers
         candidates.append((f'gp_mean_rank_{rank}', config))
         print(f"  {rank:2d}. GP Mean: {means[idx]:8.2f} ± {stds[idx]:6.2f} | {config}")
 
@@ -228,6 +246,7 @@ def extract_top_candidates(
         config = {name: samples[idx, i] for i, name in enumerate(param_names)}
         config['ntests'] = 32
         config['optimized'] = False
+        config = normalize_config(config)  # Round integers
         candidates.append((f'gp_lcb_rank_{rank}', config))
         print(f"  {rank:2d}. LCB: {lcb[idx]:8.2f} (mean: {means[idx]:8.2f}, std: {stds[idx]:6.2f})")
 
