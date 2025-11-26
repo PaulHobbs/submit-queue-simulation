@@ -1737,13 +1737,13 @@ type JSONResult struct {
 func main() {
 	// Command-line flags for optimizer
 	jsonOutput := flag.Bool("json", false, "Output results as JSON")
-	resources := flag.Int("resources", 32, "Number of parallel batches")
+	resources := flag.Int("resources", 74, "Number of parallel batches")
 	traffic := flag.Int("traffic", 8, "Traffic multiplier")
 	nTests := flag.Int("ntests", 32, "Number of tests")
-	maxBatch := flag.Int("maxbatch", 2048, "Maximum batch size")
+	maxBatch := flag.Int("maxbatch", 684, "Maximum batch size")
 	maxK := flag.Int("maxk", 12, "Maximum K sparsity")
 	kDiv := flag.Int("kdiv", 5, "K divisor")
-	flakeTol := flag.Float64("flaketol", 0.10, "Flake tolerance")
+	flakeTol := flag.Float64("flaketol", 0.0767, "Flake tolerance")
 	useOpt := flag.Bool("optimized", false, "Use optimized matrix")
 	seed := flag.Int64("seed", 0, "Random seed (0 for auto)")
 
@@ -1752,9 +1752,9 @@ func main() {
 	testStability := flag.Float64("test-stability", 1.0, "Test stability multiplier (1.0=normal, <1.0=flakier)")
 
 	// Level 2: Implicit hyperparameters (previously hardcoded)
-	verifyLatency := flag.Int("verify-latency", 2, "Ticks to verify a suspect CL")
-	fixDelay := flag.Int("fix-delay", 60, "Ticks to fix a culprit CL")
-	verifyResourceMult := flag.Int("verify-resource-mult", 16, "Resource budget multiplier for verification")
+	verifyLatency := flag.Int("verify-latency", 6, "Ticks to verify a suspect CL")
+	fixDelay := flag.Int("fix-delay", 108, "Ticks to fix a culprit CL")
+	verifyResourceMult := flag.Int("verify-resource-mult", 19, "Resource budget multiplier for verification")
 	backpressureThreshold1 := flag.Int("bp-threshold-1", 200, "First backpressure threshold")
 	backpressureThreshold2 := flag.Int("bp-threshold-2", 400, "Second backpressure threshold")
 	backpressureThreshold3 := flag.Int("bp-threshold-3", 800, "Third backpressure threshold")
@@ -1871,19 +1871,19 @@ func main() {
 
 	seqCounter := 0
 	// We allow for up to N=resourceMult * traffic parallel batches.
-	resourceMult := 4
+	// resourceMult is removed as Resources is set directly to the optimal value.
 
 	for _, trafficLevel := range []int{8} {
-		for _, optimized := range []bool{true} {
+		for _, optimized := range []bool{false} {
 			for _, numTests := range []int{32} {
-				for _, maxBatchSize := range []int{2048} {
+				for _, maxBatchSize := range []int{684} {
 					for _, maxKVal := range []int{12} {
 						for _, kDivVal := range []int{5} {
-							for _, flakeTolVal := range []float64{0.05, 0.10, 0.15} {
+							for _, flakeTolVal := range []float64{0.0767} {
 								wg.Add(1)
 								cfg := SimConfig{
 									SeqID:              seqCounter,
-									Resources:          resourceMult * trafficLevel,
+									Resources:          74,
 									Traffic:            trafficLevel,
 									NTests:             numTests,
 									MaxBatch:           maxBatchSize,

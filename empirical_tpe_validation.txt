@@ -1,0 +1,310 @@
+/Users/phobbs/code/submit-queue-simulation/.venv/lib/python3.12/site-packages/sklearn/gaussian_process/kernels.py:450: ConvergenceWarning: The optimal value found for dimension 0 of parameter k2__length_scale is close to the specified upper bound 100.0. Increasing the bound and calling fit again may find a better value.
+  warnings.warn(
+/Users/phobbs/code/submit-queue-simulation/.venv/lib/python3.12/site-packages/sklearn/gaussian_process/kernels.py:450: ConvergenceWarning: The optimal value found for dimension 5 of parameter k2__length_scale is close to the specified upper bound 100.0. Increasing the bound and calling fit again may find a better value.
+  warnings.warn(
+/Users/phobbs/code/submit-queue-simulation/.venv/lib/python3.12/site-packages/sklearn/gaussian_process/kernels.py:450: ConvergenceWarning: The optimal value found for dimension 6 of parameter k2__length_scale is close to the specified upper bound 100.0. Increasing the bound and calling fit again may find a better value.
+  warnings.warn(
+/Users/phobbs/code/submit-queue-simulation/.venv/lib/python3.12/site-packages/sklearn/gaussian_process/kernels.py:450: ConvergenceWarning: The optimal value found for dimension 7 of parameter k2__length_scale is close to the specified upper bound 100.0. Increasing the bound and calling fit again may find a better value.
+  warnings.warn(
+Loading study from level2_corrected_study.pkl...
+Loaded 150 completed trials
+Best observed value: -7983.11
+
+Fitting Gaussian Process to trial data...
+GP fitted. Log marginal likelihood: 118.62
+
+Extracting top 5 candidates by different criteria...
+
+Top 5 by Observed Value:
+   1. Observed: -7983.11 | {'resources': 81, 'maxbatch': 843, 'maxk': 11, 'kdiv': 5, 'flaketol': 0.06876839162725229, 'verify_latency': 9, 'fix_delay': 103, 'verify_resource_mult': 24, 'ntests': 32, 'optimized': False}
+   2. Observed: -8194.74 | {'resources': 74, 'maxbatch': 684, 'maxk': 12, 'kdiv': 5, 'flaketol': 0.07670635266019771, 'verify_latency': 6, 'fix_delay': 108, 'verify_resource_mult': 19, 'ntests': 32, 'optimized': False}
+   3. Observed: -8326.46 | {'resources': 17, 'maxbatch': 1241, 'maxk': 9, 'kdiv': 5, 'flaketol': 0.06577193236043309, 'verify_latency': 8, 'fix_delay': 114, 'verify_resource_mult': 21, 'ntests': 32, 'optimized': False}
+   4. Observed: -8354.75 | {'resources': 47, 'maxbatch': 2614, 'maxk': 10, 'kdiv': 5, 'flaketol': 0.07895315110934288, 'verify_latency': 10, 'fix_delay': 91, 'verify_resource_mult': 19, 'ntests': 32, 'optimized': False}
+   5. Observed: -8629.68 | {'resources': 115, 'maxbatch': 543, 'maxk': 11, 'kdiv': 6, 'flaketol': 0.06791715787537798, 'verify_latency': 6, 'fix_delay': 103, 'verify_resource_mult': 17, 'ntests': 32, 'optimized': False}
+
+Top 5 by GP Posterior Mean:
+   1. GP Mean:  6419.97 ± 10617.46 | {'fix_delay': 66, 'flaketol': np.float64(0.06219652971217039), 'kdiv': 8, 'maxbatch': 1247, 'maxk': 21, 'resources': 18, 'verify_latency': 2, 'verify_resource_mult': 30, 'ntests': 32, 'optimized': False}
+   2. GP Mean:  4412.13 ± 9365.78 | {'fix_delay': 106, 'flaketol': np.float64(0.0568752187066639), 'kdiv': 5, 'maxbatch': 994, 'maxk': 21, 'resources': 51, 'verify_latency': 1, 'verify_resource_mult': 27, 'ntests': 32, 'optimized': False}
+   3. GP Mean:  3117.69 ± 11117.36 | {'fix_delay': 100, 'flaketol': np.float64(0.056125540980494305), 'kdiv': 9, 'maxbatch': 1525, 'maxk': 21, 'resources': 103, 'verify_latency': 3, 'verify_resource_mult': 29, 'ntests': 32, 'optimized': False}
+   4. GP Mean:  2875.16 ± 9162.06 | {'fix_delay': 101, 'flaketol': np.float64(0.05934110103966643), 'kdiv': 9, 'maxbatch': 1429, 'maxk': 20, 'resources': 69, 'verify_latency': 6, 'verify_resource_mult': 26, 'ntests': 32, 'optimized': False}
+   5. GP Mean:  2648.26 ± 9205.16 | {'fix_delay': 59, 'flaketol': np.float64(0.0661579831462655), 'kdiv': 5, 'maxbatch': 1679, 'maxk': 20, 'resources': 58, 'verify_latency': 3, 'verify_resource_mult': 27, 'ntests': 32, 'optimized': False}
+
+Top 5 by GP Lower Confidence Bound (mean - 2*std):
+   1. LCB: -10295.50 (mean: -7770.50, std: 1262.50)
+   2. LCB: -10387.35 (mean: -8565.66, std: 910.85)
+   3. LCB: -10682.15 (mean: -8527.37, std: 1077.39)
+   4. LCB: -11328.65 (mean: -8941.73, std: 1193.46)
+   5. LCB: -11461.03 (mean: -7819.81, std: 1820.61)
+
+================================================================================
+Found 15 unique candidates (from 15 total)
+================================================================================
+
+ 1. Selected by 1 criteria: observed_rank_1
+ 2. Selected by 1 criteria: observed_rank_2
+ 3. Selected by 1 criteria: observed_rank_3
+ 4. Selected by 1 criteria: observed_rank_4
+ 5. Selected by 1 criteria: observed_rank_5
+ 6. Selected by 1 criteria: gp_mean_rank_1
+ 7. Selected by 1 criteria: gp_mean_rank_2
+ 8. Selected by 1 criteria: gp_mean_rank_3
+ 9. Selected by 1 criteria: gp_mean_rank_4
+10. Selected by 1 criteria: gp_mean_rank_5
+
+
+Validating: observed_rank_1
+  Config: {'resources': 81, 'maxbatch': 843, 'maxk': 11, 'kdiv': 5, 'flaketol': 0.06876839162725229, 'verify_latency': 9, 'fix_delay': 103, 'verify_resource_mult': 24, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8425.57 ± 891.57
+    normal-aggressive    ......... mean: -8378.42 ± 771.86
+    normal-conservative  ......... mean: -8133.78 ± 658.78
+    spike-std            ......... mean: -7936.55 ± 906.19
+    spike-conservative   ......... mean: -7992.96 ± 931.02
+    low                  ......... mean: -8022.62 ± 595.38
+    flaky                ......... mean: -8016.57 ± 725.83
+    crisis               ......... mean: -8845.30 ± 1214.64
+  → Weighted Mean: -8225.98 ± 102.93
+     95% CI: [-8431.83, -8020.12]
+
+Validating: observed_rank_2
+  Config: {'resources': 74, 'maxbatch': 684, 'maxk': 12, 'kdiv': 5, 'flaketol': 0.07670635266019771, 'verify_latency': 6, 'fix_delay': 108, 'verify_resource_mult': 19, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8632.30 ± 745.09
+    normal-aggressive    ......... mean: -8262.70 ± 747.75
+    normal-conservative  ......... mean: -8510.47 ± 809.52
+    spike-std            ......... mean: -7619.01 ± 621.02
+    spike-conservative   ......... mean: -7852.74 ± 758.42
+    low                  ......... mean: -8597.05 ± 694.37
+    flaky                ......... mean: -8526.70 ± 805.63
+    crisis               ......... mean: -7812.93 ± 626.50
+  → Weighted Mean: -8212.61 ± 134.27
+     95% CI: [-8481.15, -7944.07]
+
+Validating: observed_rank_3
+  Config: {'resources': 17, 'maxbatch': 1241, 'maxk': 9, 'kdiv': 5, 'flaketol': 0.06577193236043309, 'verify_latency': 8, 'fix_delay': 114, 'verify_resource_mult': 21, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8527.25 ± 908.32
+    normal-aggressive    ......... mean: -8589.14 ± 804.24
+    normal-conservative  ......... mean: -8402.09 ± 948.38
+    spike-std            ......... mean: -8517.66 ± 682.29
+    spike-conservative   ......... mean: -8547.02 ± 1142.58
+    low                  ......... mean: -8087.06 ± 585.00
+    flaky                ......... mean: -8638.01 ± 743.70
+    crisis               ......... mean: -9639.85 ± 1104.88
+  → Weighted Mean: -8605.56 ± 147.76
+     95% CI: [-8901.07, -8310.04]
+
+Validating: observed_rank_4
+  Config: {'resources': 47, 'maxbatch': 2614, 'maxk': 10, 'kdiv': 5, 'flaketol': 0.07895315110934288, 'verify_latency': 10, 'fix_delay': 91, 'verify_resource_mult': 19, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8768.27 ± 801.42
+    normal-aggressive    ......... mean: -8819.75 ± 696.78
+    normal-conservative  ......... mean: -9142.52 ± 817.23
+    spike-std            ......... mean: -8922.55 ± 998.83
+    spike-conservative   ......... mean: -8525.59 ± 918.33
+    low                  ......... mean: -8331.83 ± 624.48
+    flaky                ......... mean: -8792.12 ± 826.23
+    crisis               ......... mean: -8966.24 ± 1008.02
+  → Weighted Mean: -8777.26 ±  84.20
+     95% CI: [-8945.66, -8608.85]
+
+Validating: observed_rank_5
+  Config: {'resources': 115, 'maxbatch': 543, 'maxk': 11, 'kdiv': 6, 'flaketol': 0.06791715787537798, 'verify_latency': 6, 'fix_delay': 103, 'verify_resource_mult': 17, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8710.63 ± 765.37
+    normal-aggressive    ......... mean: -8688.03 ± 724.33
+    normal-conservative  ......... mean: -8915.52 ± 790.91
+    spike-std            ......... mean: -7644.27 ± 720.17
+    spike-conservative   ......... mean: -7665.71 ± 627.77
+    low                  ......... mean: -9025.24 ± 723.46
+    flaky                ......... mean: -8803.34 ± 741.85
+    crisis               ......... mean: -11518.27 ± 2377.89
+  → Weighted Mean: -8722.35 ± 396.37
+     95% CI: [-9515.10, -7929.60]
+
+Validating: gp_mean_rank_1
+  Config: {'fix_delay': 66, 'flaketol': np.float64(0.06219652971217039), 'kdiv': 8, 'maxbatch': 1247, 'maxk': 21, 'resources': 18, 'verify_latency': 2, 'verify_resource_mult': 30, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -15648.22 ± 1009.21
+    normal-aggressive    ......... mean: -15444.02 ± 1016.54
+    normal-conservative  ......... mean: -15552.69 ± 801.03
+    spike-std            ......... mean: -14200.90 ± 2517.14
+    spike-conservative   ......... mean: -15013.34 ± 2549.81
+    low                  ......... mean: -13128.21 ± 761.73
+    flaky                ......... mean: -15301.74 ± 1194.94
+    crisis               ......... mean: -21711.79 ± 3582.62
+  → Weighted Mean: -15589.78 ± 845.05
+     95% CI: [-17279.88, -13899.68]
+
+Validating: gp_mean_rank_2
+  Config: {'fix_delay': 106, 'flaketol': np.float64(0.0568752187066639), 'kdiv': 5, 'maxbatch': 994, 'maxk': 21, 'resources': 51, 'verify_latency': 1, 'verify_resource_mult': 27, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -10899.23 ± 921.93
+    normal-aggressive    ......... mean: -10596.92 ± 763.65
+    normal-conservative  ......... mean: -10893.24 ± 824.67
+    spike-std            ......... mean: -33524.55 ± 3398.75
+    spike-conservative   ......... mean: -34247.63 ± 3654.32
+    low                  ......... mean: -12632.87 ± 759.90
+    flaky                ......... mean: -10706.88 ± 870.47
+    crisis               ......... mean: -40912.72 ± 3658.17
+  → Weighted Mean: -20884.08 ± 4358.23
+     95% CI: [-29600.54, -12167.62]
+
+Validating: gp_mean_rank_3
+  Config: {'fix_delay': 100, 'flaketol': np.float64(0.056125540980494305), 'kdiv': 9, 'maxbatch': 1525, 'maxk': 21, 'resources': 103, 'verify_latency': 3, 'verify_resource_mult': 29, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -15685.55 ± 963.84
+    normal-aggressive    ......... mean: -15692.79 ± 1113.94
+    normal-conservative  ......... mean: -15922.23 ± 1168.46
+    spike-std            ......... mean: -26304.63 ± 3199.93
+    spike-conservative   ......... mean: -26689.55 ± 2977.52
+    low                  ......... mean: -12249.75 ± 731.34
+    flaky                ......... mean: -15774.44 ± 866.19
+    crisis               ......... mean: -40499.83 ± 3753.83
+  → Weighted Mean: -21069.06 ± 3129.34
+     95% CI: [-27327.74, -14810.39]
+
+Validating: gp_mean_rank_4
+  Config: {'fix_delay': 101, 'flaketol': np.float64(0.05934110103966643), 'kdiv': 9, 'maxbatch': 1429, 'maxk': 20, 'resources': 69, 'verify_latency': 6, 'verify_resource_mult': 26, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -15325.61 ± 848.47
+    normal-aggressive    ......... mean: -15129.93 ± 876.13
+    normal-conservative  ......... mean: -15290.04 ± 880.15
+    spike-std            ......... mean: -17426.85 ± 2343.41
+    spike-conservative   ......... mean: -17167.85 ± 2815.14
+    low                  ......... mean: -12590.15 ± 741.37
+    flaky                ......... mean: -15201.05 ± 988.28
+    crisis               ......... mean: -28227.69 ± 3827.05
+  → Weighted Mean: -16912.94 ± 1572.04
+     95% CI: [-20057.01, -13768.87]
+
+Validating: gp_mean_rank_5
+  Config: {'fix_delay': 59, 'flaketol': np.float64(0.0661579831462655), 'kdiv': 5, 'maxbatch': 1679, 'maxk': 20, 'resources': 58, 'verify_latency': 3, 'verify_resource_mult': 27, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -10612.90 ± 902.64
+    normal-aggressive    ......... mean: -10694.63 ± 746.88
+    normal-conservative  ......... mean: -10477.58 ± 760.40
+    spike-std            ......... mean: -12132.46 ± 965.80
+    spike-conservative   ......... mean: -12422.74 ± 1376.85
+    low                  ......... mean: -11993.69 ± 675.53
+    flaky                ......... mean: -10450.18 ± 763.32
+    crisis               ......... mean: -15390.46 ± 2090.43
+  → Weighted Mean: -11698.77 ± 553.72
+     95% CI: [-12806.21, -10591.33]
+
+Validating: gp_lcb_rank_1
+  Config: {'fix_delay': 26, 'flaketol': np.float64(0.07767864424247736), 'kdiv': 4, 'maxbatch': 867, 'maxk': 9, 'resources': 111, 'verify_latency': 8, 'verify_resource_mult': 30, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8554.46 ± 711.25
+    normal-aggressive    ......... mean: -8644.35 ± 974.03
+    normal-conservative  ......... mean: -8560.95 ± 709.66
+    spike-std            ......... mean: -9350.64 ± 924.33
+    spike-conservative   ......... mean: -9212.96 ± 973.95
+    low                  ......... mean: -7804.78 ± 523.00
+    flaky                ......... mean: -8660.67 ± 917.27
+    crisis               ......... mean: -8929.85 ± 954.13
+  → Weighted Mean: -8762.05 ± 157.33
+     95% CI: [-9076.71, -8447.40]
+
+Validating: gp_lcb_rank_2
+  Config: {'fix_delay': 64, 'flaketol': np.float64(0.06523834791340204), 'kdiv': 5, 'maxbatch': 1068, 'maxk': 9, 'resources': 44, 'verify_latency': 10, 'verify_resource_mult': 10, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8440.56 ± 780.50
+    normal-aggressive    ......... mean: -8718.48 ± 783.23
+    normal-conservative  ......... mean: -8295.32 ± 634.20
+    spike-std            ......... mean: -8809.92 ± 1000.41
+    spike-conservative   ......... mean: -8586.61 ± 917.88
+    low                  ......... mean: -8002.44 ± 644.22
+    flaky                ......... mean: -8472.64 ± 900.98
+    crisis               ......... mean: -10287.27 ± 1794.58
+  → Weighted Mean: -8693.63 ± 227.56
+     95% CI: [-9148.75, -8238.52]
+
+Validating: gp_lcb_rank_3
+  Config: {'fix_delay': 44, 'flaketol': np.float64(0.06788892647859478), 'kdiv': 6, 'maxbatch': 883, 'maxk': 11, 'resources': 120, 'verify_latency': 6, 'verify_resource_mult': 21, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8737.64 ± 625.88
+    normal-aggressive    ......... mean: -8903.81 ± 756.31
+    normal-conservative  ......... mean: -8832.32 ± 643.32
+    spike-std            ......... mean: -8166.89 ± 885.22
+    spike-conservative   ......... mean: -7859.33 ± 841.32
+    low                  ......... mean: -9069.71 ± 585.71
+    flaky                ......... mean: -8836.88 ± 792.13
+    crisis               ......... mean: -9404.25 ± 1961.57
+  → Weighted Mean: -8666.80 ± 162.85
+     95% CI: [-8992.50, -8341.11]
+
+Validating: gp_lcb_rank_4
+  Config: {'fix_delay': 35, 'flaketol': np.float64(0.07024162158206873), 'kdiv': 4, 'maxbatch': 1125, 'maxk': 12, 'resources': 99, 'verify_latency': 8, 'verify_resource_mult': 16, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -8508.24 ± 631.69
+    normal-aggressive    ......... mean: -8451.23 ± 802.93
+    normal-conservative  ......... mean: -8403.75 ± 715.29
+    spike-std            ......... mean: -8977.71 ± 927.62
+    spike-conservative   ......... mean: -8768.52 ± 785.12
+    low                  ......... mean: -7821.83 ± 566.96
+    flaky                ......... mean: -8666.47 ± 645.71
+    crisis               ......... mean: -9070.16 ± 1004.19
+  → Weighted Mean: -8620.61 ± 129.24
+     95% CI: [-8879.09, -8362.13]
+
+Validating: gp_lcb_rank_5
+  Config: {'fix_delay': 100, 'flaketol': np.float64(0.07979740640536181), 'kdiv': 2, 'maxbatch': 1356, 'maxk': 9, 'resources': 120, 'verify_latency': 4, 'verify_resource_mult': 30, 'ntests': 32, 'optimized': False}
+  Samples per scenario: 50
+    normal-std           ......... mean: -10336.76 ± 906.70
+    normal-aggressive    ......... mean: -10615.68 ± 909.49
+    normal-conservative  ......... mean: -10309.28 ± 676.60
+    spike-std            ......... mean: -9273.52 ± 1044.22
+    spike-conservative   ......... mean: -9534.24 ± 1120.01
+    low                  ......... mean: -8031.61 ± 558.82
+    flaky                ......... mean: -10436.35 ± 871.32
+    crisis               ......... mean: -9483.92 ± 1195.56
+  → Weighted Mean: -9764.54 ± 284.35
+     95% CI: [-10333.24, -9195.84]
+
+================================================================================
+EMPIRICAL VALIDATION RESULTS
+================================================================================
+
+Rank | Name                           | Weighted Mean | 95% CI      | vs Best
+-----|--------------------------------|---------------|-------------|----------
+   1 | observed_rank_2                |      -8212.61 | ±134.27    |   +0.00%
+   2 | observed_rank_1                |      -8225.98 | ±102.93    |   -0.16%
+   3 | observed_rank_3                |      -8605.56 | ±147.76    |   -4.78%
+   4 | gp_lcb_rank_4                  |      -8620.61 | ±129.24    |   -4.97%
+   5 | gp_lcb_rank_3                  |      -8666.80 | ±162.85    |   -5.53%
+   6 | gp_lcb_rank_2                  |      -8693.63 | ±227.56    |   -5.86%
+   7 | observed_rank_5                |      -8722.35 | ±396.37    |   -6.21%
+   8 | gp_lcb_rank_1                  |      -8762.05 | ±157.33    |   -6.69%
+   9 | observed_rank_4                |      -8777.26 | ± 84.20    |   -6.88%
+  10 | gp_lcb_rank_5                  |      -9764.54 | ±284.35    |  -18.90%
+  11 | gp_mean_rank_5                 |     -11698.77 | ±553.72    |  -42.45%
+  12 | gp_mean_rank_1                 |     -15589.78 | ±845.05    |  -89.83%
+  13 | gp_mean_rank_4                 |     -16912.94 | ±1572.04    | -105.94%
+  14 | gp_mean_rank_2                 |     -20884.08 | ±4358.23    | -154.29%
+  15 | gp_mean_rank_3                 |     -21069.06 | ±3129.34    | -156.55%
+
+Pairwise Statistical Significance (Welch's t-test):
+
+  #1 vs #2: diff=   13.36, p=0.8990 n.s.
+  #1 vs #3: diff=  392.94, p=0.0000 ***
+  #1 vs #4: diff=  408.00, p=0.0000 ***
+  #1 vs #5: diff=  454.19, p=0.0000 ***
+  #2 vs #3: diff=  379.58, p=0.0000 ***
+  #2 vs #4: diff=  394.63, p=0.0000 ***
+  #2 vs #5: diff=  440.82, p=0.0000 ***
+  #3 vs #4: diff=   15.05, p=0.5904 n.s.
+  #3 vs #5: diff=   61.24, p=0.1403 n.s.
+  #4 vs #5: diff=   46.19, p=0.0390 *
+
+Significance: *** p<0.001, ** p<0.01, * p<0.05, n.s. = not significant
+
+================================================================================
+VALIDATION COMPLETE
+================================================================================
+Total time: 51590.9s (859.8 minutes)
+Candidates validated: 15
+Samples per candidate: 400
+Total simulations: 6000
+
+Results saved to empirical_tpe_corrected_results.json

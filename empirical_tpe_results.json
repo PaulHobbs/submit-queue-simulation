@@ -1,0 +1,335 @@
+{
+  "candidates": [
+    {
+      "name": "observed_rank_1",
+      "config": {
+        "resources": 81,
+        "maxbatch": 843,
+        "maxk": 11,
+        "kdiv": 5,
+        "flaketol": 0.06876839162725229,
+        "verify_latency": 9,
+        "fix_delay": 103,
+        "verify_resource_mult": 24,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8225.977486455904,
+      "std_error": 102.92724249987663,
+      "confidence_interval": [
+        -8431.831971455656,
+        -8020.123001456151
+      ]
+    },
+    {
+      "name": "observed_rank_2",
+      "config": {
+        "resources": 74,
+        "maxbatch": 684,
+        "maxk": 12,
+        "kdiv": 5,
+        "flaketol": 0.07670635266019771,
+        "verify_latency": 6,
+        "fix_delay": 108,
+        "verify_resource_mult": 19,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8212.61251323144,
+      "std_error": 134.27005243207003,
+      "confidence_interval": [
+        -8481.152618095579,
+        -7944.072408367299
+      ]
+    },
+    {
+      "name": "observed_rank_3",
+      "config": {
+        "resources": 17,
+        "maxbatch": 1241,
+        "maxk": 9,
+        "kdiv": 5,
+        "flaketol": 0.06577193236043309,
+        "verify_latency": 8,
+        "fix_delay": 114,
+        "verify_resource_mult": 21,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8605.556939016882,
+      "std_error": 147.75719787707092,
+      "confidence_interval": [
+        -8901.071334771024,
+        -8310.04254326274
+      ]
+    },
+    {
+      "name": "observed_rank_4",
+      "config": {
+        "resources": 47,
+        "maxbatch": 2614,
+        "maxk": 10,
+        "kdiv": 5,
+        "flaketol": 0.07895315110934288,
+        "verify_latency": 10,
+        "fix_delay": 91,
+        "verify_resource_mult": 19,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8777.255895682894,
+      "std_error": 84.202560905034,
+      "confidence_interval": [
+        -8945.661017492963,
+        -8608.850773872826
+      ]
+    },
+    {
+      "name": "observed_rank_5",
+      "config": {
+        "resources": 115,
+        "maxbatch": 543,
+        "maxk": 11,
+        "kdiv": 6,
+        "flaketol": 0.06791715787537798,
+        "verify_latency": 6,
+        "fix_delay": 103,
+        "verify_resource_mult": 17,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8722.348202941563,
+      "std_error": 396.3738604813625,
+      "confidence_interval": [
+        -9515.095923904288,
+        -7929.600481978838
+      ]
+    },
+    {
+      "name": "gp_mean_rank_1",
+      "config": {
+        "fix_delay": 66,
+        "flaketol": 0.06219652971217039,
+        "kdiv": 8,
+        "maxbatch": 1247,
+        "maxk": 21,
+        "resources": 18,
+        "verify_latency": 2,
+        "verify_resource_mult": 30,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -15589.779190175219,
+      "std_error": 845.0492172762423,
+      "confidence_interval": [
+        -17279.877624727702,
+        -13899.680755622734
+      ]
+    },
+    {
+      "name": "gp_mean_rank_2",
+      "config": {
+        "fix_delay": 106,
+        "flaketol": 0.0568752187066639,
+        "kdiv": 5,
+        "maxbatch": 994,
+        "maxk": 21,
+        "resources": 51,
+        "verify_latency": 1,
+        "verify_resource_mult": 27,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -20884.08273280386,
+      "std_error": 4358.229305446766,
+      "confidence_interval": [
+        -29600.541343697394,
+        -12167.624121910329
+      ]
+    },
+    {
+      "name": "gp_mean_rank_3",
+      "config": {
+        "fix_delay": 100,
+        "flaketol": 0.056125540980494305,
+        "kdiv": 9,
+        "maxbatch": 1525,
+        "maxk": 21,
+        "resources": 103,
+        "verify_latency": 3,
+        "verify_resource_mult": 29,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -21069.063370159234,
+      "std_error": 3129.3390907866974,
+      "confidence_interval": [
+        -27327.74155173263,
+        -14810.385188585838
+      ]
+    },
+    {
+      "name": "gp_mean_rank_4",
+      "config": {
+        "fix_delay": 101,
+        "flaketol": 0.05934110103966643,
+        "kdiv": 9,
+        "maxbatch": 1429,
+        "maxk": 20,
+        "resources": 69,
+        "verify_latency": 6,
+        "verify_resource_mult": 26,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -16912.941579379585,
+      "std_error": 1572.0357188924643,
+      "confidence_interval": [
+        -20057.013017164514,
+        -13768.870141594656
+      ]
+    },
+    {
+      "name": "gp_mean_rank_5",
+      "config": {
+        "fix_delay": 59,
+        "flaketol": 0.0661579831462655,
+        "kdiv": 5,
+        "maxbatch": 1679,
+        "maxk": 20,
+        "resources": 58,
+        "verify_latency": 3,
+        "verify_resource_mult": 27,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -11698.766561441207,
+      "std_error": 553.719808777976,
+      "confidence_interval": [
+        -12806.20617899716,
+        -10591.326943885255
+      ]
+    },
+    {
+      "name": "gp_lcb_rank_1",
+      "config": {
+        "fix_delay": 26,
+        "flaketol": 0.07767864424247736,
+        "kdiv": 4,
+        "maxbatch": 867,
+        "maxk": 9,
+        "resources": 111,
+        "verify_latency": 8,
+        "verify_resource_mult": 30,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8762.0520432892,
+      "std_error": 157.32689713437088,
+      "confidence_interval": [
+        -9076.705837557942,
+        -8447.39824902046
+      ]
+    },
+    {
+      "name": "gp_lcb_rank_2",
+      "config": {
+        "fix_delay": 64,
+        "flaketol": 0.06523834791340204,
+        "kdiv": 5,
+        "maxbatch": 1068,
+        "maxk": 9,
+        "resources": 44,
+        "verify_latency": 10,
+        "verify_resource_mult": 10,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8693.634599474173,
+      "std_error": 227.55668106934718,
+      "confidence_interval": [
+        -9148.747961612868,
+        -8238.521237335479
+      ]
+    },
+    {
+      "name": "gp_lcb_rank_3",
+      "config": {
+        "fix_delay": 44,
+        "flaketol": 0.06788892647859478,
+        "kdiv": 6,
+        "maxbatch": 883,
+        "maxk": 11,
+        "resources": 120,
+        "verify_latency": 6,
+        "verify_resource_mult": 21,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8666.801203299381,
+      "std_error": 162.84717964617326,
+      "confidence_interval": [
+        -8992.495562591728,
+        -8341.106844007034
+      ]
+    },
+    {
+      "name": "gp_lcb_rank_4",
+      "config": {
+        "fix_delay": 35,
+        "flaketol": 0.07024162158206873,
+        "kdiv": 4,
+        "maxbatch": 1125,
+        "maxk": 12,
+        "resources": 99,
+        "verify_latency": 8,
+        "verify_resource_mult": 16,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -8620.610356979181,
+      "std_error": 129.23851745985885,
+      "confidence_interval": [
+        -8879.087391898898,
+        -8362.133322059464
+      ]
+    },
+    {
+      "name": "gp_lcb_rank_5",
+      "config": {
+        "fix_delay": 100,
+        "flaketol": 0.07979740640536181,
+        "kdiv": 2,
+        "maxbatch": 1356,
+        "maxk": 9,
+        "resources": 120,
+        "verify_latency": 4,
+        "verify_resource_mult": 30,
+        "ntests": 32,
+        "optimized": false
+      },
+      "weighted_mean": -9764.538896825397,
+      "std_error": 284.35103880873953,
+      "confidence_interval": [
+        -10333.240974442877,
+        -9195.836819207918
+      ]
+    }
+  ],
+  "best_candidate": {
+    "name": "observed_rank_1",
+    "config": {
+      "resources": 81,
+      "maxbatch": 843,
+      "maxk": 11,
+      "kdiv": 5,
+      "flaketol": 0.06876839162725229,
+      "verify_latency": 9,
+      "fix_delay": 103,
+      "verify_resource_mult": 24,
+      "ntests": 32,
+      "optimized": false
+    },
+    "weighted_mean": -8225.977486455904
+  }
+}
