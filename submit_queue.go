@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/bits"
@@ -13,7 +15,7 @@ import (
 	"time"
 )
 
-const ProbCulprit = 0.03
+var ProbCulprit = 0.03 // Default culprit probability, can be overridden
 
 // --- RNG & Basic Structures (Unchanged) ---
 
@@ -520,6 +522,7 @@ type CulpritQueueSubmitQueue struct {
 	MaxK             int
 	KDivisor         int
 	FlakeTolerance   float64
+	ImplicitParams   ImplicitParams
 
 	// State
 	RepoBasePPass      []float64
@@ -552,7 +555,7 @@ type CulpritQueueSubmitQueue struct {
 	TestDemotionEvents   int
 }
 
-func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, useOptimizedMatrix bool, maxK, kDivisor int, flakeTolerance float64) *CulpritQueueSubmitQueue {
+func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int, rng *FastRNG, useOptimizedMatrix bool, maxK, kDivisor int, flakeTolerance float64, implicitParams ImplicitParams) *CulpritQueueSubmitQueue {
 	sq := &CulpritQueueSubmitQueue{
 		TestDefs:          testDefs,
 		AllTestIDs:        make([]int, len(testDefs)),
@@ -569,6 +572,7 @@ func NewCulpritQueueSubmitQueue(testDefs []TestDefinition, resources, maxMB int,
 		MaxK:              maxK,
 		KDivisor:          kDivisor,
 		FlakeTolerance:    flakeTolerance,
+		ImplicitParams:    implicitParams,
 	}
 
 	for i, t := range testDefs {
@@ -651,9 +655,9 @@ func (sq *CulpritQueueSubmitQueue) processVerificationQueue(currentTick int) ([]
 	for _, cl := range sq.VerificationQueue {
 		// Start verification if resources allow
 		if cl.State == StateSuspect {
-			if activeVerifications < sq.ResourceBudget*16 {
+			if activeVerifications < sq.ResourceBudget*sq.ImplicitParams.VerifyResourceMult {
 				cl.State = StateVerifying
-				cl.VerifyDoneTick = currentTick + 2 // VerificationLatency
+				cl.VerifyDoneTick = currentTick + sq.ImplicitParams.VerifyLatency
 				activeVerifications++
 				sq.TotalVerifications++
 			}
@@ -672,7 +676,7 @@ func (sq *CulpritQueueSubmitQueue) processVerificationQueue(currentTick int) ([]
 					submitted = append(submitted, cl)
 				} else {
 					cl.State = StateFixing
-					cl.FixDoneTick = currentTick + 60 // FixDelay
+					cl.FixDoneTick = currentTick + sq.ImplicitParams.FixDelay
 					sq.FixingQueue = append(sq.FixingQueue, cl)
 					sq.TotalCulpritsCaught++
 				}
@@ -1152,6 +1156,15 @@ type SimConfig struct {
 	FlakeTolerance float64
 }
 
+type ImplicitParams struct {
+	VerifyLatency          int
+	FixDelay               int
+	VerifyResourceMult     int
+	BackpressureThreshold1 int
+	BackpressureThreshold2 int
+	BackpressureThreshold3 int
+}
+
 type SimResult struct {
 	Config              SimConfig
 	Slowdown            float64
@@ -1181,7 +1194,196 @@ type SimResult struct {
 	WaitTimeHistogram   string
 }
 
+func runSimulationWithStability(cfg SimConfig, seed int64, testStability float64, implicitParams ImplicitParams) SimResult {
+	// Reduced iterations for faster testing during optimization
+	// Original: primingIter = 3 * 12 * 7 = 252, nIter = 60 * 12 * 7 = 5040
+	const primingIter = 3 * 12 * 7     // 36 iterations (was 252)
+	const nIter = 60 * 12 * 7          // 720 iterations (was 5040)
+	rng := NewFastRNG(seed)
+
+	testDefs := make([]TestDefinition, cfg.NTests)
+	for i := 0; i < cfg.NTests; i++ {
+		// Scale pass rates by stability factor
+		// testStability = 1.0: normal
+		// testStability < 1.0: flakier tests (lower pass rates)
+		basePassRates := []DistEntry{
+			{0.5, 1.0},
+			{0.55, 0.995},
+			{0.59, 0.98},
+			{0.60, 0.95},
+			{0.64, 0.80},
+			{0.68, 0.20},
+			{1.0, 0.0},
+		}
+
+		// Scale pass rates: move them closer to 0 if stability < 1.0
+		scaledPassRates := make([]DistEntry, len(basePassRates))
+		for j, entry := range basePassRates {
+			scaledValue := entry.Value * testStability
+			if scaledValue < 0 {
+				scaledValue = 0
+			}
+			scaledPassRates[j] = DistEntry{
+				Limit: entry.Limit,
+				Value: scaledValue,
+			}
+		}
+
+		testDefs[i] = TestDefinition{
+			ID: i,
+			PAffected: 0.005,
+			PassRates: scaledPassRates,
+		}
+	}
+
+	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance, implicitParams)
+	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
+
+	totalQ := 0
+	submittedTotal := 0
+
+	for i := 0; i < primingIter+nIter; i++ {
+		if i == primingIter {
+			sq.ResetStats()
+		}
+
+		submitted := sq.Step(i)
+
+		if i >= primingIter {
+			submittedTotal += submitted
+			totalQ += len(sq.PendingChanges)
+		}
+
+		qSize := len(sq.PendingChanges)
+		changesToAdd := cfg.Traffic * nChangesPer2Hour[i%12]
+
+		// Backpressure
+		if qSize >= implicitParams.BackpressureThreshold1 && qSize < implicitParams.BackpressureThreshold2 {
+			changesToAdd /= 2
+		}
+		if qSize >= implicitParams.BackpressureThreshold2 && qSize < implicitParams.BackpressureThreshold3 {
+			changesToAdd /= 4
+		}
+		if qSize >= implicitParams.BackpressureThreshold3 {
+			changesToAdd /= 8
+		}
+
+		if changesToAdd > 0 {
+			sq.AddChanges(changesToAdd, i)
+		}
+	}
+
+	mbPassRate := 0.0
+	if sq.TotalMinibatches > 0 {
+		mbPassRate = float64(sq.PassedMinibatches) / float64(sq.TotalMinibatches)
+	}
+
+	avgSubmitTime := 0.0
+	if sq.TotalSubmitted > 0 {
+		avgSubmitTime = 2.0 + 2*float64(sq.TotalWaitTicks)/float64(sq.TotalSubmitted)
+	}
+
+	throughput := 0.0
+	if nIter > 0 {
+		throughput = float64(submittedTotal) / float64(nIter)
+	}
+
+	slowdown := math.Inf(1)
+	if throughput > 0 {
+		slowdown = float64(idealThroughput*cfg.Traffic) / throughput
+	}
+
+	victimRate := 0.0
+	if sq.TotalVerifications > 0 {
+		victimRate = float64(sq.TotalVictims) / float64(sq.TotalVerifications)
+	}
+
+	avgRuns := 0.0
+	if sq.TotalSubmitted > 0 {
+		avgRuns = (float64(sq.TotalMinibatches) + float64(sq.TotalVerifications) / 16) / float64(sq.TotalSubmitted)
+	}
+
+	// Calculate culprit detection stats
+	falseNegativeRate := 0.0
+	if sq.TotalCulpritsCreated > 0 {
+		culpritsEscaped := sq.TotalCulpritsCreated - sq.TotalCulpritsCaught
+		falseNegativeRate = float64(culpritsEscaped) / float64(sq.TotalCulpritsCreated)
+	}
+
+	truePositiveRate := 0.0
+	totalFlagged := sq.TotalCulpritsCaught + sq.TotalInnocentFlagged
+	if totalFlagged > 0 {
+		truePositiveRate = float64(sq.TotalCulpritsCaught) / float64(totalFlagged)
+	}
+
+	// Calculate wait time percentiles
+	sortedWaitTimes := make([]int, len(sq.WaitTimes))
+	copy(sortedWaitTimes, sq.WaitTimes)
+	sort.Ints(sortedWaitTimes)
+
+	waitP50 := percentile(sortedWaitTimes, 0.50)
+	waitP95 := percentile(sortedWaitTimes, 0.95)
+	waitP99 := percentile(sortedWaitTimes, 0.99)
+	waitMin := 0
+	waitMax := 0
+	if len(sortedWaitTimes) > 0 {
+		waitMin = sortedWaitTimes[0]
+		waitMax = sortedWaitTimes[len(sortedWaitTimes)-1]
+	}
+
+	// Create sparkline for queue depth
+	queueSparkline := sparkline(sq.QueueDepths, 50)
+
+	// Calculate batch utilization
+	batchUtil := 0.0
+	if sq.TotalBatchSlots > 0 {
+		batchUtil = float64(sq.UsedBatchSlots) / float64(sq.TotalBatchSlots)
+	}
+
+	// Create wait time histogram
+	waitHistogram := histogram(sortedWaitTimes, 8, 30)
+
+	return SimResult{
+		Config:              cfg,
+		Slowdown:            slowdown,
+		AvgQueueSize:        float64(totalQ) / float64(nIter),
+		MBPassRate:          mbPassRate,
+		VictimRate:          victimRate,
+		AvgSubmitTime:       avgSubmitTime,
+		AvgRunsPerSubmitted: avgRuns,
+		CulpritsCreated:     sq.TotalCulpritsCreated,
+		CulpritsCaught:      sq.TotalCulpritsCaught,
+		InnocentFlagged:     sq.TotalInnocentFlagged,
+		FalseNegativeRate:   falseNegativeRate,
+		TruePositiveRate:    truePositiveRate,
+		WaitTimeP50:         waitP50,
+		WaitTimeP95:         waitP95,
+		WaitTimeP99:         waitP99,
+		WaitTimeMin:         waitMin,
+		WaitTimeMax:         waitMax,
+		QueueDepthSparkline: queueSparkline,
+		MaxQueueDepth:       sq.MaxQueueDepth,
+		BatchUtilization:    batchUtil,
+		MaxVerifyQueue:      sq.MaxVerificationQueue,
+		ActiveTests:         len(sq.activeTestIDs),
+		DemotedTests:        sq.TestDemotionEvents,
+		WaitTimeHistogram:   waitHistogram,
+	}
+}
+
 func runSimulation(cfg SimConfig, seed int64) SimResult {
+	defaultImplicitParams := ImplicitParams{
+		VerifyLatency:          2,
+		FixDelay:               60,
+		VerifyResourceMult:     16,
+		BackpressureThreshold1: 200,
+		BackpressureThreshold2: 400,
+		BackpressureThreshold3: 800,
+	}
+	return runSimulationWithStability(cfg, seed, 1.0, defaultImplicitParams)
+}
+
+func runSimulationOriginal(cfg SimConfig, seed int64, implicitParams ImplicitParams) SimResult {
 	// Reduced iterations for faster testing during optimization
 	// Original: primingIter = 3 * 12 * 7 = 252, nIter = 60 * 12 * 7 = 5040
 	const primingIter = 3 * 12 * 7     // 36 iterations (was 252)
@@ -1205,7 +1407,7 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		}
 	}
 
-	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance)
+	sq := NewCulpritQueueSubmitQueue(testDefs, cfg.Resources, cfg.MaxBatch, rng, cfg.UseOptimizedMatrix, cfg.MaxK, cfg.KDivisor, cfg.FlakeTolerance, implicitParams)
 	sq.AddChanges(cfg.Traffic*nChangesPer2Hour[len(nChangesPer2Hour)-1], 0)
 
 	totalQ := 0
@@ -1227,13 +1429,13 @@ func runSimulation(cfg SimConfig, seed int64) SimResult {
 		changesToAdd := cfg.Traffic * nChangesPer2Hour[i%12]
 
 		// Backpressure
-		if qSize >= 200 && qSize < 400 {
+		if qSize >= implicitParams.BackpressureThreshold1 && qSize < implicitParams.BackpressureThreshold2 {
 			changesToAdd /= 2
 		}
-		if qSize >= 400 && qSize < 800 {
+		if qSize >= implicitParams.BackpressureThreshold2 && qSize < implicitParams.BackpressureThreshold3 {
 			changesToAdd /= 4
 		}
-		if qSize >= 800 {
+		if qSize >= implicitParams.BackpressureThreshold3 {
 			changesToAdd /= 8
 		}
 
@@ -1490,7 +1692,123 @@ func printIncremental(res SimResult, lastCfg *SimConfig) {
 	printDetailedStats(res)
 }
 
+// JSONResult represents the simulation result in JSON format
+type JSONResult struct {
+	Config              SimConfig `json:"config"`
+	Slowdown            float64   `json:"slowdown"`
+	AvgQueueSize        float64   `json:"avg_queue_size"`
+	MBPassRate          float64   `json:"mb_pass_rate"`
+	VictimRate          float64   `json:"victim_rate"`
+	AvgSubmitTime       float64   `json:"avg_submit_time"`
+	AvgRunsPerSubmitted float64   `json:"avg_runs_per_submitted"`
+	CulpritsCreated     int       `json:"culprits_created"`
+	CulpritsCaught      int       `json:"culprits_caught"`
+	InnocentFlagged     int       `json:"innocent_flagged"`
+	FalseNegativeRate   float64   `json:"false_negative_rate"`
+	TruePositiveRate    float64   `json:"true_positive_rate"`
+	WaitTimeP50         int       `json:"wait_time_p50"`
+	WaitTimeP95         int       `json:"wait_time_p95"`
+	WaitTimeP99         int       `json:"wait_time_p99"`
+	MaxQueueDepth       int       `json:"max_queue_depth"`
+	BatchUtilization    float64   `json:"batch_utilization"`
+	MaxVerifyQueue      int       `json:"max_verify_queue"`
+	ActiveTests         int       `json:"active_tests"`
+	DemotedTests        int       `json:"demoted_tests"`
+}
+
 func main() {
+	// Command-line flags for optimizer
+	jsonOutput := flag.Bool("json", false, "Output results as JSON")
+	resources := flag.Int("resources", 32, "Number of parallel batches")
+	traffic := flag.Int("traffic", 8, "Traffic multiplier")
+	nTests := flag.Int("ntests", 32, "Number of tests")
+	maxBatch := flag.Int("maxbatch", 2048, "Maximum batch size")
+	maxK := flag.Int("maxk", 12, "Maximum K sparsity")
+	kDiv := flag.Int("kdiv", 5, "K divisor")
+	flakeTol := flag.Float64("flaketol", 0.10, "Flake tolerance")
+	useOpt := flag.Bool("optimized", false, "Use optimized matrix")
+	seed := flag.Int64("seed", 0, "Random seed (0 for auto)")
+
+	// Scenario variation parameters
+	culpritProb := flag.Float64("culprit-prob", 0.03, "Probability that a CL is a culprit")
+	testStability := flag.Float64("test-stability", 1.0, "Test stability multiplier (1.0=normal, <1.0=flakier)")
+
+	// Level 2: Implicit hyperparameters (previously hardcoded)
+	verifyLatency := flag.Int("verify-latency", 2, "Ticks to verify a suspect CL")
+	fixDelay := flag.Int("fix-delay", 60, "Ticks to fix a culprit CL")
+	verifyResourceMult := flag.Int("verify-resource-mult", 16, "Resource budget multiplier for verification")
+	backpressureThreshold1 := flag.Int("bp-threshold-1", 200, "First backpressure threshold")
+	backpressureThreshold2 := flag.Int("bp-threshold-2", 400, "Second backpressure threshold")
+	backpressureThreshold3 := flag.Int("bp-threshold-3", 800, "Third backpressure threshold")
+
+	flag.Parse()
+
+	// Apply scenario parameters
+	ProbCulprit = *culpritProb
+
+	// Store implicit params for passing to simulation
+	implicitParams := ImplicitParams{
+		VerifyLatency:          *verifyLatency,
+		FixDelay:               *fixDelay,
+		VerifyResourceMult:     *verifyResourceMult,
+		BackpressureThreshold1: *backpressureThreshold1,
+		BackpressureThreshold2: *backpressureThreshold2,
+		BackpressureThreshold3: *backpressureThreshold3,
+	}
+
+	// If JSON mode, run single simulation with given parameters
+	if *jsonOutput {
+		cfg := SimConfig{
+			SeqID:              0,
+			Resources:          *resources,
+			Traffic:            *traffic,
+			NTests:             *nTests,
+			MaxBatch:           *maxBatch,
+			UseOptimizedMatrix: *useOpt,
+			MaxK:               *maxK,
+			KDivisor:           *kDiv,
+			FlakeTolerance:     *flakeTol,
+		}
+
+		if *seed == 0 {
+			*seed = time.Now().UnixNano()
+		}
+
+		res := runSimulationWithStability(cfg, *seed, *testStability, implicitParams)
+
+		jsonRes := JSONResult{
+			Config:              res.Config,
+			Slowdown:            res.Slowdown,
+			AvgQueueSize:        res.AvgQueueSize,
+			MBPassRate:          res.MBPassRate,
+			VictimRate:          res.VictimRate,
+			AvgSubmitTime:       res.AvgSubmitTime,
+			AvgRunsPerSubmitted: res.AvgRunsPerSubmitted,
+			CulpritsCreated:     res.CulpritsCreated,
+			CulpritsCaught:      res.CulpritsCaught,
+			InnocentFlagged:     res.InnocentFlagged,
+			FalseNegativeRate:   res.FalseNegativeRate,
+			TruePositiveRate:    res.TruePositiveRate,
+			WaitTimeP50:         res.WaitTimeP50,
+			WaitTimeP95:         res.WaitTimeP95,
+			WaitTimeP99:         res.WaitTimeP99,
+			MaxQueueDepth:       res.MaxQueueDepth,
+			BatchUtilization:    res.BatchUtilization,
+			MaxVerifyQueue:      res.MaxVerifyQueue,
+			ActiveTests:         res.ActiveTests,
+			DemotedTests:        res.DemotedTests,
+		}
+
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(jsonRes); err != nil {
+			fmt.Fprintf(os.Stderr, "error encoding JSON: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Normal mode: run the original sweep
 	// Enable CPU profiling if CPUPROFILE env var is set
 	if cpuprofile := os.Getenv("CPUPROFILE"); cpuprofile != "" {
 		f, err := os.Create(cpuprofile)
@@ -1534,27 +1852,27 @@ func main() {
 	}()
 
 	seqCounter := 0
-	// We allow for up to N=resources * traffic parallel batches.
-	resources := 4
+	// We allow for up to N=resourceMult * traffic parallel batches.
+	resourceMult := 4
 
-	for _, traffic := range []int{8} {
+	for _, trafficLevel := range []int{8} {
 		for _, optimized := range []bool{true} {
-			for _, nTests := range []int{32} {
-				for _, maxBatch := range []int{2048} {
-					for _, maxK := range []int{12} {
-						for _, kDiv := range []int{5} {
-							for _, flakeTol := range []float64{0.05, 0.10, 0.15} {
+			for _, numTests := range []int{32} {
+				for _, maxBatchSize := range []int{2048} {
+					for _, maxKVal := range []int{12} {
+						for _, kDivVal := range []int{5} {
+							for _, flakeTolVal := range []float64{0.05, 0.10, 0.15} {
 								wg.Add(1)
 								cfg := SimConfig{
 									SeqID:              seqCounter,
-									Resources:          resources * traffic,
-									Traffic:            traffic,
-									NTests:             nTests,
-									MaxBatch:           maxBatch,
+									Resources:          resourceMult * trafficLevel,
+									Traffic:            trafficLevel,
+									NTests:             numTests,
+									MaxBatch:           maxBatchSize,
 									UseOptimizedMatrix: optimized,
-									MaxK:               maxK,
-									KDivisor:           kDiv,
-									FlakeTolerance:     flakeTol,
+									MaxK:               maxKVal,
+									KDivisor:           kDivVal,
+									FlakeTolerance:     flakeTolVal,
 								}
 								go func(c SimConfig) {
 									defer wg.Done()

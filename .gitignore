@@ -1,2 +1,9 @@
 output.txt
 *.pyc
+*.prof
+*_results.txt
+optimization_results.txt
+robust_results.txt
+empirical_tpe_validation.txt
+submit_queue
+.claude/settings.local.json
