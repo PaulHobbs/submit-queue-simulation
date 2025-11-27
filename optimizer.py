@@ -35,8 +35,9 @@ MAX_SLOWDOWN = 100
 class SimulationRunner:
     """Runs Go simulation and parses results."""
 
-    def __init__(self, binary_path='./submit_queue'):
+    def __init__(self, binary_path='./submit_queue', csv_file=None):
         self.binary_path = binary_path
+        self.csv_file = csv_file
         self.run_count = 0
         self.timeout_count = 0
 
@@ -55,6 +56,13 @@ class SimulationRunner:
         args = [
             self.binary_path,
             '-json',
+        ]
+
+        # Add CSV file if provided
+        if self.csv_file:
+            args.extend(['-csv', self.csv_file])
+
+        args.extend([
             '-resources', str(config['resources']),
             '-traffic', str(config['traffic']),
             '-ntests', str(config['ntests']),
@@ -64,7 +72,7 @@ class SimulationRunner:
             '-flaketol', str(config['flaketol']),
             '-optimized', str(config.get('optimized', False)).lower(),
             '-seed', str(seed),
-        ]
+        ])
 
         try:
             result = subprocess.run(
@@ -321,11 +329,12 @@ def main():
     parser.add_argument('--max-samples', type=int, default=20, help='Max samples per config')
     parser.add_argument('--binary', type=str, default='./submit_queue', help='Path to simulation binary')
     parser.add_argument('--fix-resources', type=int, help='Fix resources instead of optimizing')
+    parser.add_argument('--csv', type=str, help='CSV file with test history')
 
     args = parser.parse_args()
 
     # Setup
-    runner = SimulationRunner(args.binary)
+    runner = SimulationRunner(args.binary, csv_file=args.csv)
     objective_fn = ObjectiveFunction()
     sampler = AdaptiveSampler(
         runner,
